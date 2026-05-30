@@ -1,0 +1,13 @@
+bin/
+obj/
+.vs/
+.dotnet/
+.nuget/
+.appdata/
+*.user
+*.suo
+*.log
+.downloads
+dist/
+EzVideoCut/tools/ffmpeg.exe
+EzVideoCut/tools/ffprobe.exe
