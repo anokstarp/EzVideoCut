@@ -9,7 +9,8 @@ Lightweight WPF demo for previewing a video, choosing a start/end range, and cut
 - Seek through a timeline.
 - Seek backward/forward with the left/right arrow keys using a selectable step.
 - Toggle play/pause with Space when not typing in a text field.
-- Preview multiple audio tracks together when available and adjust preview volume without changing the exported file.
+- Select and preview one audio track when multiple audio tracks are available.
+- Remove selected audio tracks from the exported file when cutting.
 - Set start/end from the current playback position.
 - Type start/end with digits only; input is normalized to `HH:MM:SS.mmm`.
 - Confirm the possible container-boundary offset before cutting.
@@ -35,18 +36,6 @@ dotnet build EzVideoCut\EzVideoCut.csproj
 
 ```powershell
 dotnet run --project EzVideoCut\EzVideoCut.csproj
-```
-
-## Create an exe folder
-
-```powershell
-dotnet publish EzVideoCut\EzVideoCut.csproj -c Release -r win-x64 --self-contained true -o dist\EzVideoCut-win-x64
-```
-
-Run:
-
-```powershell
-dist\EzVideoCut-win-x64\EzVideoCut.exe
 ```
 
 ## FFmpeg note

@@ -19,6 +19,7 @@ public partial class MainWindow : Window
     private readonly LibVLC _libVlc;
     private readonly VlcMediaPlayer _mediaPlayer;
     private readonly List<AdditionalAudioPlayer> _additionalAudioPlayers = new();
+    private readonly List<AudioTrackOption> _audioTrackOptions = new();
 
     private string? _inputPath;
     private string? _outputPath;
@@ -28,11 +29,14 @@ public partial class MainWindow : Window
     private bool _isDraggingTimeline;
     private bool _isUpdatingTimeline;
     private bool _isPlaybackPaused = true;
+    private int? _selectedAudioTrackDisplayIndex;
+    private int _audioPlaybackStateVersion;
     private int _masterVolume = 100;
 
     public MainWindow()
     {
         InitializeComponent();
+        AudioTrackHelpText.Text = string.Empty;
 
         Core.Initialize();
         _libVlc = new LibVLC("--no-video-title-show");
@@ -135,7 +139,7 @@ public partial class MainWindow : Window
 
         _inputPath = dialog.FileName;
 
-        DisposeAdditionalAudioPlayers();
+        ClearAudioTrackOptions();
         FileNameText.Text = Path.GetFileName(_inputPath);
         SetOutputPath(BuildDefaultOutputPath(_inputPath));
         ResetCutProgress();
@@ -154,16 +158,20 @@ public partial class MainWindow : Window
             SetStartTime(TimeSpan.Zero, adjustEnd: false);
             SetEndTime(_duration, adjustStart: false);
 
+            ApplyPrimaryAudioVolumeOnly();
+            _isPlaybackPaused = true;
             using var media = new VlcMedia(_libVlc, new Uri(_inputPath));
             _mediaPlayer.Play(media);
-            _mediaPlayer.Mute = true;
-            _mediaPlayer.Volume = 0;
-            _isPlaybackPaused = false;
+            _mediaPlayer.SetPause(true);
             _positionTimer.Start();
 
-            PlayPauseButton.Content = "일시정지";
+            PlayPauseButton.Content = "재생";
             SetControlsEnabled(true);
             await StartAdditionalAudioTracksAsync();
+            _isPlaybackPaused = false;
+            _mediaPlayer.SetPause(false);
+            ApplySelectedAudioTrack();
+            PlayPauseButton.Content = "?쇱떆?뺤?";
             StatusText.Text = "영상이 열렸습니다.";
         }
         catch (Exception ex)
@@ -188,9 +196,8 @@ public partial class MainWindow : Window
 
         if (!_isPlaybackPaused)
         {
-            _mediaPlayer.SetPause(true);
-            PauseAdditionalAudioPlayers();
             _isPlaybackPaused = true;
+            _mediaPlayer.SetPause(true);
             PlayPauseButton.Content = "재생";
         }
         else
@@ -202,7 +209,6 @@ public partial class MainWindow : Window
 
             _mediaPlayer.Play();
             _mediaPlayer.SetPause(false);
-            PlayAdditionalAudioPlayers();
             _isPlaybackPaused = false;
             PlayPauseButton.Content = "일시정지";
         }
@@ -282,7 +288,7 @@ public partial class MainWindow : Window
         CutButton.IsEnabled = false;
         StatusText.Text = "자르기 확인 메시지를 준비하는 중...";
 
-        var noticeText = BuildCutNotice(start, end);
+        var noticeText = BuildCutNotice();
         var answer = MessageBox.Show(this, noticeText, "자르기 확인", MessageBoxButton.YesNo, MessageBoxImage.Information);
         if (answer != MessageBoxResult.Yes)
         {
@@ -290,11 +296,30 @@ public partial class MainWindow : Window
             ValidateTrimRange();
             return;
         }
+        var excludedAudioTracks = _audioTrackOptions
+            .Where(track => track.ExcludeFromOutput)
+            .ToArray();
+        if (excludedAudioTracks.Length > 0)
+        {
+            var trackList = string.Join(", ", excludedAudioTracks.Select(track => $"{track.DisplayIndex}번"));
+            var deleteAnswer = MessageBox.Show(
+                this,
+                $"오디오 제거는 음소거가 아니라 출력 파일에서 트랙이 제거됩니다.\n\n제거할 오디오 트랙: {trackList}\n\n계속 진행하시겠습니까?",
+                "오디오 트랙 제거 확인",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
+            if (deleteAnswer != MessageBoxResult.Yes)
+            {
+                StatusText.Text = "?먮Ⅴ湲곕? 痍⑥냼?덉뒿?덈떎.";
+                ValidateTrimRange();
+                return;
+            }
+        }
 
         SetOutputPath(GetAvailableOutputPath(_outputPath));
 
         var trimDuration = end - start;
-        var args = new[]
+        var args = new List<string>
         {
             "-hide_banner",
             "-nostdin",
@@ -309,13 +334,23 @@ public partial class MainWindow : Window
             "-t",
             ToFfmpegTime(trimDuration),
             "-map",
-            "0",
+            "0"
+        };
+
+        foreach (var audioTrack in excludedAudioTracks)
+        {
+            args.Add("-map");
+            args.Add($"-0:a:{audioTrack.DisplayIndex - 1}");
+        }
+
+        args.AddRange(new[]
+        {
             "-c",
             "copy",
             "-avoid_negative_ts",
             "make_zero",
             _outputPath
-        };
+        });
 
         _isCutting = true;
         SetControlsEnabled(false);
@@ -437,10 +472,10 @@ public partial class MainWindow : Window
 
     private void VolumeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
-        _masterVolume = (int)Math.Round(e.NewValue);
+        _masterVolume = (int)Math.Clamp(Math.Round(e.NewValue), 0, 100);
         VolumeValueText.Text = $"{_masterVolume}%";
-        _mediaPlayer.Volume = _additionalAudioPlayers.Count == 0 ? _masterVolume : 0;
-        ApplyAdditionalAudioVolume();
+
+        ApplyPrimaryAudioVolumeOnly();
     }
 
     private void PositionTimer_Tick(object? sender, EventArgs e)
@@ -456,12 +491,9 @@ public partial class MainWindow : Window
         _isUpdatingTimeline = true;
         TimelineSlider.Value = Math.Clamp(current.TotalMilliseconds, TimelineSlider.Minimum, TimelineSlider.Maximum);
         _isUpdatingTimeline = false;
-        SynchronizeAdditionalAudioPlayers(current, force: false);
-
         if (!_isPlaybackPaused && IsAtPlaybackEnd())
         {
             _isPlaybackPaused = true;
-            PauseAdditionalAudioPlayers();
         }
 
         PlayPauseButton.Content = _isPlaybackPaused ? "재생" : "일시정지";
@@ -471,7 +503,7 @@ public partial class MainWindow : Window
     {
         ComponentDispatcher.ThreadPreprocessMessage -= ComponentDispatcher_ThreadPreprocessMessage;
         _positionTimer.Stop();
-        DisposeAdditionalAudioPlayers();
+        ClearAudioTrackOptions();
         VideoView.MediaPlayer = null;
         _mediaPlayer.Dispose();
         _libVlc.Dispose();
@@ -527,13 +559,11 @@ public partial class MainWindow : Window
         textBox.CaretIndex = textBox.Text.Length;
     }
 
-    private static string BuildCutNotice(TimeSpan selectedStart, TimeSpan selectedEnd)
+    private static string BuildCutNotice()
     {
         return
-            $"시작지점: {FormatTime(selectedStart)}\n" +
-            $"종료지점: {FormatTime(selectedEnd)}\n\n" +
-            "시작지점과 종료지점이 컨테이너 경계 때문에 약간의 오차가 있을 수 있습니다.\n\n" +
-            "계속 자를까요?";
+            "시작지점과 종료지점이 컨테이너 경계로 인한 오차가 있을 수 있습니다.\n" +
+            "계속 진행하시겠습니까?";
     }
 
     private async Task<TimeSpan> ProbeDurationAsync(string inputPath)
@@ -611,7 +641,7 @@ public partial class MainWindow : Window
 
     private async Task StartAdditionalAudioTracksAsync()
     {
-        DisposeAdditionalAudioPlayers();
+        ClearAudioTrackOptions();
         if (_inputPath is null)
         {
             return;
@@ -634,40 +664,21 @@ public partial class MainWindow : Window
 
         if (tracks.Length == 0)
         {
-            _mediaPlayer.Mute = false;
-            _mediaPlayer.Volume = _masterVolume;
+            ApplyPrimaryAudioVolumeOnly();
+            AudioTrackHost.Visibility = Visibility.Collapsed;
             return;
         }
 
-        _mediaPlayer.Mute = true;
-        _mediaPlayer.Volume = 0;
-        var currentTime = GetCurrentTime();
         for (var index = 0; index < tracks.Length; index++)
         {
             var track = tracks[index];
-            var audioLibVlc = new LibVLC("--no-video-title-show", "--no-video");
-            var player = new VlcMediaPlayer(audioLibVlc)
-            {
-                Mute = true,
-                Volume = 0
-            };
-            var media = new VlcMedia(
-                audioLibVlc,
-                new Uri(_inputPath),
-                ":no-video",
-                $":audio-track-id={track.Id}",
-                $":audio-track={index}");
-
             var displayName = string.IsNullOrWhiteSpace(track.Name) ? $"Track {index + 1}" : track.Name;
-            _additionalAudioPlayers.Add(new AdditionalAudioPlayer(track.Id, index + 1, displayName, audioLibVlc, player, media));
-            player.Play(media);
+            _audioTrackOptions.Add(new AudioTrackOption(track.Id, index + 1, displayName));
         }
 
-        foreach (var audio in _additionalAudioPlayers)
-        {
-            await InitializeAdditionalAudioPlayerAsync(audio, currentTime);
-            ApplyAudioSettings(audio);
-        }
+        _selectedAudioTrackDisplayIndex = _audioTrackOptions.FirstOrDefault()?.DisplayIndex;
+        ApplySelectedAudioTrack();
+        PopulateAudioTrackControls();
     }
 
     private static async Task InitializeAdditionalAudioPlayerAsync(AdditionalAudioPlayer audio, TimeSpan currentTime)
@@ -712,20 +723,14 @@ public partial class MainWindow : Window
 
     private void PlayAdditionalAudioPlayers()
     {
-        var currentTime = GetCurrentTime();
-        foreach (var audio in _additionalAudioPlayers)
-        {
-            audio.Player.Play();
-            audio.Player.SetAudioTrack(audio.SelectedTrackId);
-
-            ApplyAudioSettings(audio);
-        }
-
-        SynchronizeAdditionalAudioPlayers(currentTime, force: true);
+        _isPlaybackPaused = false;
+        ApplyAudioPlaybackStateOrdered(syncTime: true);
     }
 
     private void PauseAdditionalAudioPlayers()
     {
+        _audioPlaybackStateVersion++;
+        _isPlaybackPaused = true;
         foreach (var audio in _additionalAudioPlayers)
         {
             audio.Player.SetPause(true);
@@ -734,17 +739,313 @@ public partial class MainWindow : Window
 
     private void ApplyAdditionalAudioVolume()
     {
+        ApplyAdditionalAudioVolumeOnly();
+    }
+
+    private void ApplyPrimaryAudioVolumeOnly()
+    {
+        _mediaPlayer.Mute = _masterVolume <= 0;
+        _mediaPlayer.Volume = _masterVolume;
+    }
+
+    private void ApplyAdditionalAudioVolumeOnly()
+    {
         foreach (var audio in _additionalAudioPlayers)
         {
-            ApplyAudioSettings(audio);
+            var isSelected = _selectedAudioTrackDisplayIndex == audio.DisplayIndex;
+            if (isSelected)
+            {
+                audio.Player.Mute = _masterVolume <= 0;
+                audio.Player.Volume = _masterVolume;
+            }
+            else
+            {
+                audio.Player.Volume = 0;
+            }
         }
     }
 
-    private void ApplyAudioSettings(AdditionalAudioPlayer audio)
+    private void ApplyPrimaryAudioSettings()
     {
-        audio.Player.Mute = false;
-        audio.Player.Volume = _masterVolume;
-        audio.Player.SetPause(_isPlaybackPaused);
+        if (_additionalAudioPlayers.Count == 0)
+        {
+            ApplyPrimaryAudioVolumeOnly();
+            return;
+        }
+
+        _mediaPlayer.SetAudioTrack(-1);
+        _mediaPlayer.Mute = true;
+        _mediaPlayer.Volume = 0;
+    }
+
+    private void ApplyAudioPlaybackState(bool syncTime)
+    {
+        if (_additionalAudioPlayers.Count == 0)
+        {
+            ApplyPrimaryAudioVolumeOnly();
+            _mediaPlayer.SetPause(_isPlaybackPaused);
+            return;
+        }
+
+        _mediaPlayer.Mute = true;
+        _mediaPlayer.Volume = 0;
+
+        var currentMilliseconds = (long)Math.Round(GetCurrentTime().TotalMilliseconds);
+        foreach (var audio in _additionalAudioPlayers)
+        {
+            audio.Player.Volume = 0;
+            audio.Player.SetPause(true);
+            audio.Player.Mute = false;
+
+            if (syncTime)
+            {
+                audio.Player.Time = currentMilliseconds;
+            }
+        }
+
+        var selectedAudio = _additionalAudioPlayers
+            .FirstOrDefault(audio => audio.DisplayIndex == _selectedAudioTrackDisplayIndex);
+        if (selectedAudio is null)
+        {
+            StatusText.Text = "선택된 오디오 트랙을 찾을 수 없습니다.";
+            return;
+        }
+
+        selectedAudio.Player.SetAudioTrack(selectedAudio.SelectedTrackId);
+        if (syncTime)
+        {
+            selectedAudio.Player.Time = currentMilliseconds;
+        }
+
+        selectedAudio.Player.Mute = _masterVolume <= 0;
+        selectedAudio.Player.Volume = _masterVolume;
+
+        if (!_isPlaybackPaused)
+        {
+            selectedAudio.Player.Play();
+            if (syncTime)
+            {
+                selectedAudio.Player.Time = currentMilliseconds;
+            }
+
+            selectedAudio.Player.SetPause(false);
+        }
+        else
+        {
+            selectedAudio.Player.SetPause(true);
+        }
+    }
+
+    private void ApplyAudioPlaybackStateOrdered(bool syncTime)
+    {
+        var version = ++_audioPlaybackStateVersion;
+        _ = ApplyAudioPlaybackStateOrderedAsync(syncTime, version);
+    }
+
+    private async Task ApplyAudioPlaybackStateOrderedAsync(bool syncTime, int version)
+    {
+        if (_additionalAudioPlayers.Count == 0)
+        {
+            ApplyPrimaryAudioVolumeOnly();
+            _mediaPlayer.SetPause(_isPlaybackPaused);
+            return;
+        }
+
+        _mediaPlayer.Mute = true;
+        _mediaPlayer.Volume = 0;
+
+        var currentMilliseconds = (long)Math.Round(GetCurrentTime().TotalMilliseconds);
+        var selectedAudio = _additionalAudioPlayers
+            .FirstOrDefault(audio => audio.DisplayIndex == _selectedAudioTrackDisplayIndex);
+        if (selectedAudio is null)
+        {
+            StatusText.Text = "선택된 오디오 트랙을 찾을 수 없습니다.";
+            return;
+        }
+
+        foreach (var audio in _additionalAudioPlayers)
+        {
+            if (audio == selectedAudio)
+            {
+                continue;
+            }
+
+            audio.Player.Volume = 0;
+            audio.Player.SetPause(true);
+            audio.Player.Mute = false;
+
+            if (syncTime)
+            {
+                audio.Player.Time = currentMilliseconds;
+            }
+        }
+
+        if (version != _audioPlaybackStateVersion)
+        {
+            return;
+        }
+
+        selectedAudio.Player.SetAudioTrack(selectedAudio.SelectedTrackId);
+        if (syncTime)
+        {
+            selectedAudio.Player.Time = currentMilliseconds;
+        }
+
+        selectedAudio.Player.Mute = _masterVolume <= 0;
+        selectedAudio.Player.Volume = _masterVolume;
+
+        if (_isPlaybackPaused)
+        {
+            selectedAudio.Player.SetPause(true);
+            return;
+        }
+
+        selectedAudio.Player.Play();
+        if (syncTime)
+        {
+            selectedAudio.Player.Time = currentMilliseconds;
+        }
+
+        await Dispatcher.Yield(DispatcherPriority.Background);
+        if (version != _audioPlaybackStateVersion)
+        {
+            return;
+        }
+
+        var latestMilliseconds = (long)Math.Round(GetCurrentTime().TotalMilliseconds);
+        selectedAudio.Player.SetAudioTrack(selectedAudio.SelectedTrackId);
+        if (syncTime)
+        {
+            selectedAudio.Player.Time = latestMilliseconds;
+        }
+
+        selectedAudio.Player.Mute = _masterVolume <= 0;
+        selectedAudio.Player.Volume = _masterVolume;
+        selectedAudio.Player.SetPause(false);
+    }
+
+    private void PopulateAudioTrackControls()
+    {
+        AudioTracksPanel.Children.Clear();
+        AudioTrackHost.Visibility = _audioTrackOptions.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+
+        foreach (var audio in _audioTrackOptions)
+        {
+            AudioTracksPanel.Children.Add(CreateAudioTrackOptionControl(audio));
+        }
+
+        UpdateAudioTrackButtonStates();
+    }
+
+    private UIElement CreateAudioTrackOptionControl(AudioTrackOption audio)
+    {
+        var box = new Border
+        {
+            Margin = new Thickness(0, 0, 10, 0),
+            Padding = new Thickness(8),
+            BorderBrush = System.Windows.Media.Brushes.LightGray,
+            BorderThickness = new Thickness(1),
+            Background = System.Windows.Media.Brushes.White
+        };
+
+        var panel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal
+        };
+        box.Child = panel;
+
+        panel.Children.Add(CreateAudioTrackButton(audio.DisplayIndex.ToString(CultureInfo.InvariantCulture), audio, audio.Name));
+
+        var deleteCheckBox = new CheckBox
+        {
+            Content = "제거",
+            Tag = audio,
+            IsChecked = audio.ExcludeFromOutput,
+            Margin = new Thickness(8, 0, 0, 0),
+            VerticalAlignment = VerticalAlignment.Center,
+            ToolTip = "자르기 결과에서 이 오디오 트랙 제거"
+        };
+        deleteCheckBox.Checked += OutputAudioTrackCheckBox_Changed;
+        deleteCheckBox.Unchecked += OutputAudioTrackCheckBox_Changed;
+        panel.Children.Add(deleteCheckBox);
+
+        return box;
+    }
+
+    private Button CreateAudioTrackButton(string text, object tag, string? toolTip)
+    {
+        var button = new Button
+        {
+            Content = text,
+            Tag = tag,
+            ToolTip = toolTip,
+            MinWidth = 48,
+            Height = 32,
+            Padding = new Thickness(12, 0, 12, 0)
+        };
+        button.Click += AudioTrackButton_Click;
+        return button;
+    }
+
+    private void OutputAudioTrackCheckBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (sender is CheckBox checkBox && checkBox.Tag is AudioTrackOption audio)
+        {
+            audio.ExcludeFromOutput = checkBox.IsChecked == true;
+        }
+    }
+
+    private void AudioTrackButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button button)
+        {
+            return;
+        }
+
+        if (button.Tag is not AudioTrackOption audio)
+        {
+            return;
+        }
+
+        _selectedAudioTrackDisplayIndex = audio.DisplayIndex;
+        ApplySelectedAudioTrack();
+        ReportSelectedAudioTrack();
+    }
+
+    private void ApplySelectedAudioTrack()
+    {
+        var selectedAudio = _audioTrackOptions
+            .FirstOrDefault(audio => audio.DisplayIndex == _selectedAudioTrackDisplayIndex);
+        if (selectedAudio is null)
+        {
+            StatusText.Text = "선택된 오디오 트랙을 찾을 수 없습니다.";
+            return;
+        }
+
+        _mediaPlayer.SetAudioTrack(selectedAudio.TrackId);
+        ApplyPrimaryAudioVolumeOnly();
+        UpdateAudioTrackButtonStates();
+    }
+
+    private void UpdateAudioTrackButtonStates()
+    {
+        foreach (var button in AudioTracksPanel.Children
+            .OfType<Border>()
+            .Select(border => border.Child)
+            .OfType<StackPanel>()
+            .SelectMany(panel => panel.Children.OfType<Button>()))
+        {
+            var isSelected = button.Tag is AudioTrackOption audio
+                && _selectedAudioTrackDisplayIndex == audio.DisplayIndex;
+            button.FontWeight = isSelected ? FontWeights.SemiBold : FontWeights.Normal;
+            button.Background = isSelected ? SystemColors.HighlightBrush : SystemColors.ControlBrush;
+            button.Foreground = isSelected ? SystemColors.HighlightTextBrush : SystemColors.ControlTextBrush;
+        }
+    }
+
+    private void ReportSelectedAudioTrack()
+    {
+        StatusText.Text = $"오디오 트랙 {_selectedAudioTrackDisplayIndex} 재생";
     }
 
     private UIElement CreateAudioTrackControl(AdditionalAudioPlayer audio)
@@ -772,8 +1073,8 @@ public partial class MainWindow : Window
 
         var enabledCheckBox = new CheckBox
         {
-            Content = "미리듣기 켜기",
-            IsChecked = audio.IsEnabled,
+            Content = "음소거",
+            IsChecked = !audio.IsEnabled,
             Tag = audio,
             Margin = new Thickness(0, 8, 0, 0)
         };
@@ -788,15 +1089,11 @@ public partial class MainWindow : Window
     {
         if (sender is CheckBox checkBox && checkBox.Tag is AdditionalAudioPlayer audio)
         {
-            audio.IsEnabled = checkBox.IsChecked == true;
-            if (audio.IsEnabled)
-            {
-                audio.Player.Play();
-                audio.Player.SetAudioTrack(audio.SelectedTrackId);
-                audio.Player.Time = (long)Math.Round(GetCurrentTime().TotalMilliseconds);
-            }
-
-            ApplyAudioSettings(audio);
+            audio.IsEnabled = checkBox.IsChecked != true;
+            audio.Player.SetAudioTrack(audio.SelectedTrackId);
+            audio.Player.Time = (long)Math.Round(GetCurrentTime().TotalMilliseconds);
+            ApplyAudioPlaybackStateOrdered(syncTime: true);
+            audio.Player.SetPause(_isPlaybackPaused);
             ReportAudioTrackState(audio);
         }
     }
@@ -804,7 +1101,7 @@ public partial class MainWindow : Window
     private void ReportAudioTrackState(AdditionalAudioPlayer audio)
     {
         StatusText.Text =
-            $"트랙 {audio.DisplayIndex} 미리듣기 {(audio.IsEnabled ? "켜짐" : "꺼짐")} | " +
+            $"트랙 {audio.DisplayIndex} {(audio.IsEnabled ? "재생" : "음소거")} | " +
             $"선택 트랙 ID {audio.Player.AudioTrack} / 요청 {audio.TrackId}";
     }
 
@@ -828,6 +1125,7 @@ public partial class MainWindow : Window
 
     private void DisposeAdditionalAudioPlayers()
     {
+        _audioPlaybackStateVersion++;
         foreach (var audio in _additionalAudioPlayers)
         {
             audio.Player.Stop();
@@ -837,6 +1135,15 @@ public partial class MainWindow : Window
         }
 
         _additionalAudioPlayers.Clear();
+        _selectedAudioTrackDisplayIndex = null;
+        AudioTracksPanel.Children.Clear();
+        AudioTrackHost.Visibility = Visibility.Collapsed;
+    }
+
+    private void ClearAudioTrackOptions()
+    {
+        _audioTrackOptions.Clear();
+        _selectedAudioTrackDisplayIndex = null;
         AudioTracksPanel.Children.Clear();
         AudioTrackHost.Visibility = Visibility.Collapsed;
     }
@@ -881,7 +1188,6 @@ public partial class MainWindow : Window
         var milliseconds = (long)Math.Round(target.TotalMilliseconds);
         _mediaPlayer.Time = milliseconds;
         CurrentTimeText.Text = FormatTime(target);
-        SynchronizeAdditionalAudioPlayers(target, force: true);
 
         _isUpdatingTimeline = true;
         TimelineSlider.Value = Math.Clamp(target.TotalMilliseconds, TimelineSlider.Minimum, TimelineSlider.Maximum);
@@ -1187,6 +1493,24 @@ public partial class MainWindow : Window
         public VlcMedia Media { get; }
 
         public bool IsEnabled { get; set; } = true;
+    }
+
+    private sealed class AudioTrackOption
+    {
+        public AudioTrackOption(int trackId, int displayIndex, string name)
+        {
+            TrackId = trackId;
+            DisplayIndex = displayIndex;
+            Name = name;
+        }
+
+        public int TrackId { get; }
+
+        public int DisplayIndex { get; }
+
+        public string Name { get; }
+
+        public bool ExcludeFromOutput { get; set; }
     }
 
     private sealed record ProcessResult(int ExitCode, string Output, string Error);
