@@ -3,8 +3,10 @@ using System.Globalization;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Interop;
+using System.Windows.Media;
 using System.Windows.Threading;
 using LibVLCSharp.Shared;
 using Microsoft.Win32;
@@ -15,20 +17,31 @@ namespace EzVideoCut;
 
 public partial class MainWindow : Window
 {
+    private enum CutMode
+    {
+        Range,
+        Split
+    }
+
     private readonly DispatcherTimer _positionTimer;
     private readonly LibVLC _libVlc;
     private readonly VlcMediaPlayer _mediaPlayer;
     private readonly List<AdditionalAudioPlayer> _additionalAudioPlayers = new();
     private readonly List<AudioTrackOption> _audioTrackOptions = new();
+    private readonly Stopwatch _playbackClock = Stopwatch.StartNew();
 
     private string? _inputPath;
     private string? _outputPath;
     private TimeSpan _duration = TimeSpan.Zero;
+    private TimeSpan _displayTimeBase = TimeSpan.Zero;
+    private TimeSpan _displayClockBase = TimeSpan.Zero;
+    private TimeSpan _lastVlcSyncClock = TimeSpan.Zero;
     private bool _controlsEnabled;
     private bool _isCutting;
     private bool _isDraggingTimeline;
     private bool _isUpdatingTimeline;
     private bool _isPlaybackPaused = true;
+    private bool _isPlaybackEnded;
     private int? _selectedAudioTrackDisplayIndex;
     private int _audioPlaybackStateVersion;
     private int _masterVolume = 100;
@@ -36,6 +49,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        UpdateCutModeVisibility();
         AudioTrackHelpText.Text = string.Empty;
 
         Core.Initialize();
@@ -54,13 +68,15 @@ public partial class MainWindow : Window
 
         _positionTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(200)
+            Interval = TimeSpan.FromMilliseconds(100)
         };
         _positionTimer.Tick += PositionTimer_Tick;
 
         ComponentDispatcher.ThreadPreprocessMessage += ComponentDispatcher_ThreadPreprocessMessage;
         Closed += MainWindow_Closed;
     }
+
+    private CutMode CurrentCutMode => CutModeTabs.SelectedIndex == 0 ? CutMode.Split : CutMode.Range;
 
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
@@ -124,6 +140,24 @@ public partial class MainWindow : Window
         Keyboard.Focus(this);
     }
 
+    private void VideoHost_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        const double aspectRatio = 16d / 9d;
+        var availableWidth = Math.Max(0, e.NewSize.Width - VideoHost.BorderThickness.Left - VideoHost.BorderThickness.Right);
+        var availableHeight = Math.Max(0, e.NewSize.Height - VideoHost.BorderThickness.Top - VideoHost.BorderThickness.Bottom);
+        var width = availableWidth;
+        var height = width / aspectRatio;
+
+        if (height > availableHeight)
+        {
+            height = availableHeight;
+            width = height * aspectRatio;
+        }
+
+        VideoSurface.Width = width;
+        VideoSurface.Height = height;
+    }
+
     private async void OpenButton_Click(object sender, RoutedEventArgs e)
     {
         var dialog = new OpenFileDialog
@@ -143,7 +177,6 @@ public partial class MainWindow : Window
         FileNameText.Text = Path.GetFileName(_inputPath);
         SetOutputPath(BuildDefaultOutputPath(_inputPath));
         ResetCutProgress();
-        EmptyVideoText.Visibility = Visibility.Collapsed;
         StatusText.Text = "영상 정보를 읽는 중...";
 
         SetControlsEnabled(false);
@@ -155,14 +188,20 @@ public partial class MainWindow : Window
             CurrentTimeText.Text = FormatTime(TimeSpan.Zero);
             TimelineSlider.Maximum = Math.Max(1, _duration.TotalMilliseconds);
             TimelineSlider.Value = 0;
+            ResetDisplayClock(TimeSpan.Zero);
             SetStartTime(TimeSpan.Zero, adjustEnd: false);
             SetEndTime(_duration, adjustStart: false);
+            SetSplitTime(TimeSpan.Zero);
 
             ApplyPrimaryAudioVolumeOnly();
             _isPlaybackPaused = true;
+            _isPlaybackEnded = false;
             using var media = new VlcMedia(_libVlc, new Uri(_inputPath));
+            VideoView.Visibility = Visibility.Visible;
+            EmptyVideoText.Visibility = Visibility.Collapsed;
             _mediaPlayer.Play(media);
             _mediaPlayer.SetPause(true);
+            ResetDisplayClock(TimeSpan.Zero);
             _positionTimer.Start();
 
             PlayPauseButton.Content = "재생";
@@ -170,12 +209,15 @@ public partial class MainWindow : Window
             await StartAdditionalAudioTracksAsync();
             _isPlaybackPaused = false;
             _mediaPlayer.SetPause(false);
+            ResetDisplayClock(TimeSpan.FromMilliseconds(Math.Max(0, _mediaPlayer.Time)));
             ApplySelectedAudioTrack();
             PlayPauseButton.Content = "?쇱떆?뺤?";
             StatusText.Text = "영상이 열렸습니다.";
         }
         catch (Exception ex)
         {
+            VideoView.Visibility = Visibility.Collapsed;
+            EmptyVideoText.Visibility = Visibility.Visible;
             StatusText.Text = $"영상 선택 실패: {Shorten(ex.Message)}";
             MessageBox.Show(this, ex.Message, "영상 선택 실패", MessageBoxButton.OK, MessageBoxImage.Error);
             SetControlsEnabled(false);
@@ -197,19 +239,24 @@ public partial class MainWindow : Window
         if (!_isPlaybackPaused)
         {
             _isPlaybackPaused = true;
+            _isPlaybackEnded = false;
             _mediaPlayer.SetPause(true);
+            SyncDisplayClockFromVlc(force: true);
             PlayPauseButton.Content = "재생";
         }
         else
         {
             if (IsAtPlaybackEnd())
             {
-                SeekTo(TimeSpan.Zero);
+                RestartPlaybackFrom(TimeSpan.Zero);
+                return;
             }
 
             _mediaPlayer.Play();
             _mediaPlayer.SetPause(false);
             _isPlaybackPaused = false;
+            _isPlaybackEnded = false;
+            ResetDisplayClock(GetCurrentTime());
             PlayPauseButton.Content = "일시정지";
         }
     }
@@ -224,6 +271,22 @@ public partial class MainWindow : Window
     {
         SetEndTime(GetCurrentTime(), adjustStart: true);
         ValidateTrimRange();
+    }
+
+    private void SetSplitButton_Click(object sender, RoutedEventArgs e)
+    {
+        SetSplitTime(GetCurrentTime());
+        ValidateTrimRange();
+    }
+
+    private void CutModeTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (sender != CutModeTabs)
+        {
+            return;
+        }
+
+        UpdateCutModeVisibility();
     }
 
     private void PickOutputButton_Click(object sender, RoutedEventArgs e)
@@ -274,12 +337,18 @@ public partial class MainWindow : Window
 
     private async void CutButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_isCutting || _inputPath is null || _outputPath is null || !TryReadTrimRange(out var start, out var end))
+        if (_isCutting || _inputPath is null || _outputPath is null)
         {
             return;
         }
 
-        if (Path.GetFullPath(_inputPath).Equals(Path.GetFullPath(_outputPath), StringComparison.OrdinalIgnoreCase))
+        var cutJobs = BuildCutJobs(_outputPath);
+        if (cutJobs.Length == 0)
+        {
+            return;
+        }
+
+        if (cutJobs.Any(job => Path.GetFullPath(_inputPath).Equals(Path.GetFullPath(job.OutputPath), StringComparison.OrdinalIgnoreCase)))
         {
             MessageBox.Show(this, "입력 파일과 출력 파일이 같을 수 없습니다.", "저장 위치 확인", MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
@@ -299,6 +368,8 @@ public partial class MainWindow : Window
         var excludedAudioTracks = _audioTrackOptions
             .Where(track => track.ExcludeFromOutput)
             .ToArray();
+        var hasMutedAudioTracks = _audioTrackOptions
+            .Any(track => track.MuteInOutput && !track.ExcludeFromOutput);
         if (excludedAudioTracks.Length > 0)
         {
             var trackList = string.Join(", ", excludedAudioTracks.Select(track => $"{track.DisplayIndex}번"));
@@ -316,63 +387,46 @@ public partial class MainWindow : Window
             }
         }
 
-        SetOutputPath(GetAvailableOutputPath(_outputPath));
-
-        var trimDuration = end - start;
-        var args = new List<string>
+        if (CurrentCutMode == CutMode.Range)
         {
-            "-hide_banner",
-            "-nostdin",
-            "-progress",
-            "pipe:1",
-            "-nostats",
-            "-y",
-            "-ss",
-            ToFfmpegTime(start),
-            "-i",
-            _inputPath,
-            "-t",
-            ToFfmpegTime(trimDuration),
-            "-map",
-            "0"
-        };
-
-        foreach (var audioTrack in excludedAudioTracks)
-        {
-            args.Add("-map");
-            args.Add($"-0:a:{audioTrack.DisplayIndex - 1}");
+            SetOutputPath(cutJobs[0].OutputPath);
         }
-
-        args.AddRange(new[]
-        {
-            "-c",
-            "copy",
-            "-avoid_negative_ts",
-            "make_zero",
-            _outputPath
-        });
 
         _isCutting = true;
         SetControlsEnabled(false);
         CutButton.Content = "자르는 중...";
-        StatusText.Text = "ffmpeg copy 컷을 실행 중입니다.";
+        StatusText.Text = hasMutedAudioTracks
+            ? "ffmpeg 컷과 오디오 음소거를 실행 중입니다."
+            : "ffmpeg copy 컷을 실행 중입니다.";
 
         var stopwatch = Stopwatch.StartNew();
         UpdateCutProgress(0, stopwatch.Elapsed, null);
 
         try
         {
-            var result = await RunFfmpegCutAsync(ResolveToolPath("ffmpeg.exe"), args, trimDuration, stopwatch);
-            if (result.ExitCode != 0)
+            for (var index = 0; index < cutJobs.Length; index++)
             {
-                throw new InvalidOperationException(result.Error.Length > 0 ? result.Error : result.Output);
+                var job = cutJobs[index];
+                var progressTitle = cutJobs.Length > 1
+                    ? $"{index + 1}/{cutJobs.Length} part{index + 1} 생성 중"
+                    : null;
+                UpdateCutProgress(0, stopwatch.Elapsed, null, progressTitle);
+                var args = BuildFfmpegCutArguments(_inputPath, job.Start, job.Duration, job.OutputPath, _audioTrackOptions);
+                var result = await RunFfmpegCutAsync(ResolveToolPath("ffmpeg.exe"), args, job.Duration, stopwatch, progressTitle);
+                if (result.ExitCode != 0)
+                {
+                    throw new InvalidOperationException(result.Error.Length > 0 ? result.Error : result.Output);
+                }
             }
 
             UpdateCutProgress(100, stopwatch.Elapsed, TimeSpan.Zero);
-            StatusText.Text = $"완료: {Path.GetFileName(_outputPath)}";
+            StatusText.Text = $"완료: {string.Join(", ", cutJobs.Select(job => Path.GetFileName(job.OutputPath)))}";
             MessageBox.Show(this, "자르기 완료", "완료", MessageBoxButton.OK, MessageBoxImage.Information);
 
-            SetOutputPath(GetAvailableOutputPath(_outputPath));
+            if (CurrentCutMode == CutMode.Range)
+            {
+                SetOutputPath(GetAvailableOutputPath(_outputPath));
+            }
         }
         catch (Exception ex)
         {
@@ -446,7 +500,32 @@ public partial class MainWindow : Window
 
     private void TimelineSlider_PreviewMouseDown(object sender, MouseButtonEventArgs e)
     {
+        if (_inputPath is null)
+        {
+            return;
+        }
+
+        if (e.OriginalSource is DependencyObject source && IsInsideThumb(source))
+        {
+            _isDraggingTimeline = true;
+            return;
+        }
+
         _isDraggingTimeline = true;
+        SeekToTimelineClick(e.GetPosition(TimelineSlider));
+        TimelineSlider.CaptureMouse();
+        e.Handled = true;
+    }
+
+    private void TimelineSlider_PreviewMouseMove(object sender, MouseEventArgs e)
+    {
+        if (_inputPath is null || !_isDraggingTimeline || e.LeftButton != MouseButtonState.Pressed)
+        {
+            return;
+        }
+
+        SeekToTimelineClick(e.GetPosition(TimelineSlider));
+        e.Handled = true;
     }
 
     private void TimelineSlider_PreviewMouseUp(object sender, MouseButtonEventArgs e)
@@ -454,6 +533,11 @@ public partial class MainWindow : Window
         if (_inputPath is null)
         {
             return;
+        }
+
+        if (TimelineSlider.IsMouseCaptured)
+        {
+            TimelineSlider.ReleaseMouseCapture();
         }
 
         _isDraggingTimeline = false;
@@ -468,6 +552,32 @@ public partial class MainWindow : Window
         }
 
         SeekToSliderValue();
+    }
+
+    private void SeekToTimelineClick(Point point)
+    {
+        var width = TimelineSlider.ActualWidth;
+        if (width <= 0)
+        {
+            return;
+        }
+
+        var ratio = Math.Clamp(point.X / width, 0, 1);
+        var value = TimelineSlider.Minimum + ratio * (TimelineSlider.Maximum - TimelineSlider.Minimum);
+        SeekTo(TimeSpan.FromMilliseconds(value));
+    }
+
+    private static bool IsInsideThumb(DependencyObject source)
+    {
+        for (var current = source; current is not null; current = VisualTreeHelper.GetParent(current))
+        {
+            if (current is Thumb)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void VolumeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -485,7 +595,8 @@ public partial class MainWindow : Window
             return;
         }
 
-        var current = GetCurrentTime();
+        SyncDisplayClockFromVlc(force: false);
+        var current = GetDisplayTime();
         CurrentTimeText.Text = FormatTime(current);
 
         _isUpdatingTimeline = true;
@@ -493,7 +604,9 @@ public partial class MainWindow : Window
         _isUpdatingTimeline = false;
         if (!_isPlaybackPaused && IsAtPlaybackEnd())
         {
+            SyncDisplayClockFromVlc(force: true);
             _isPlaybackPaused = true;
+            _isPlaybackEnded = true;
         }
 
         PlayPauseButton.Content = _isPlaybackPaused ? "재생" : "일시정지";
@@ -553,6 +666,25 @@ public partial class MainWindow : Window
         SetTimeText(EndTextBox, value);
     }
 
+    private void SetSplitTime(TimeSpan value)
+    {
+        SetTimeText(SplitTextBox, ClampTime(value));
+    }
+
+    private void UpdateCutModeVisibility()
+    {
+        if (RangeStartGrid is null || RangeEndGrid is null || SplitPointGrid is null)
+        {
+            return;
+        }
+
+        var splitMode = CurrentCutMode == CutMode.Split;
+        RangeStartGrid.Visibility = splitMode ? Visibility.Collapsed : Visibility.Visible;
+        RangeEndGrid.Visibility = splitMode ? Visibility.Collapsed : Visibility.Visible;
+        SplitPointGrid.Visibility = splitMode ? Visibility.Visible : Visibility.Collapsed;
+        ValidateTrimRange();
+    }
+
     private static void SetTimeText(TextBox textBox, TimeSpan value)
     {
         textBox.Text = FormatTime(value);
@@ -598,11 +730,17 @@ public partial class MainWindow : Window
         var canCut = _controlsEnabled
             && !_isCutting
             && _inputPath is not null
-            && _outputPath is not null
-            && TryReadTrimRange(out var start, out var end)
-            && end > start
-            && start >= TimeSpan.Zero
-            && (_duration == TimeSpan.Zero || end <= _duration);
+            && _outputPath is not null;
+
+        if (canCut)
+        {
+            canCut = CurrentCutMode == CutMode.Split
+                ? TryReadSplitPoint(out _)
+                : TryReadTrimRange(out var start, out var end)
+                    && end > start
+                    && start >= TimeSpan.Zero
+                    && (_duration == TimeSpan.Zero || end <= _duration);
+        }
 
         CutButton.IsEnabled = canCut;
     }
@@ -621,14 +759,30 @@ public partial class MainWindow : Window
         return start <= end;
     }
 
+    private bool TryReadSplitPoint(out TimeSpan splitPoint)
+    {
+        if (!TryParseTimeInput(SplitTextBox.Text, out splitPoint))
+        {
+            splitPoint = TimeSpan.Zero;
+            return false;
+        }
+
+        splitPoint = ClampTime(splitPoint);
+        return _duration > TimeSpan.Zero
+            && splitPoint > TimeSpan.Zero
+            && splitPoint < _duration;
+    }
+
     private void SetControlsEnabled(bool enabled)
     {
         _controlsEnabled = enabled;
 
         OpenButton.IsEnabled = !_isCutting;
+        CutModeTabs.IsEnabled = !_isCutting;
         PlayPauseButton.IsEnabled = enabled || (_isCutting && _inputPath is not null);
         SetStartButton.IsEnabled = enabled;
         SetEndButton.IsEnabled = enabled;
+        SetSplitButton.IsEnabled = enabled;
         PickOutputButton.IsEnabled = enabled;
         OpenOutputFolderButton.IsEnabled = enabled
             && !string.IsNullOrWhiteSpace(_outputPath)
@@ -950,24 +1104,58 @@ public partial class MainWindow : Window
 
         var panel = new StackPanel
         {
-            Orientation = Orientation.Horizontal
+            Orientation = Orientation.Vertical
         };
         box.Child = panel;
 
-        panel.Children.Add(CreateAudioTrackButton(audio.DisplayIndex.ToString(CultureInfo.InvariantCulture), audio, audio.Name));
+        var titlePanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal
+        };
+        titlePanel.Children.Add(CreateAudioTrackButton(audio.DisplayIndex.ToString(CultureInfo.InvariantCulture), audio, audio.Name));
+        titlePanel.Children.Add(new TextBlock
+        {
+            Text = audio.Name,
+            Margin = new Thickness(8, 0, 0, 0),
+            MaxWidth = 180,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            ToolTip = audio.Name
+        });
+        panel.Children.Add(titlePanel);
+
+        var optionsPanel = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Margin = new Thickness(0, 8, 0, 0)
+        };
 
         var deleteCheckBox = new CheckBox
         {
             Content = "제거",
             Tag = audio,
             IsChecked = audio.ExcludeFromOutput,
-            Margin = new Thickness(8, 0, 0, 0),
             VerticalAlignment = VerticalAlignment.Center,
             ToolTip = "자르기 결과에서 이 오디오 트랙 제거"
         };
         deleteCheckBox.Checked += OutputAudioTrackCheckBox_Changed;
         deleteCheckBox.Unchecked += OutputAudioTrackCheckBox_Changed;
-        panel.Children.Add(deleteCheckBox);
+        optionsPanel.Children.Add(deleteCheckBox);
+
+        var muteCheckBox = new CheckBox
+        {
+            Content = "음소거",
+            Tag = audio,
+            IsChecked = audio.MuteInOutput,
+            Margin = new Thickness(12, 0, 0, 0),
+            VerticalAlignment = VerticalAlignment.Center,
+            ToolTip = "트랙은 유지하고 출력 오디오만 0으로 만들기"
+        };
+        muteCheckBox.Checked += OutputAudioTrackMuteCheckBox_Changed;
+        muteCheckBox.Unchecked += OutputAudioTrackMuteCheckBox_Changed;
+        optionsPanel.Children.Add(muteCheckBox);
+
+        panel.Children.Add(optionsPanel);
 
         return box;
     }
@@ -992,6 +1180,24 @@ public partial class MainWindow : Window
         if (sender is CheckBox checkBox && checkBox.Tag is AudioTrackOption audio)
         {
             audio.ExcludeFromOutput = checkBox.IsChecked == true;
+            if (audio.ExcludeFromOutput && audio.MuteInOutput)
+            {
+                audio.MuteInOutput = false;
+                PopulateAudioTrackControls();
+            }
+        }
+    }
+
+    private void OutputAudioTrackMuteCheckBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (sender is CheckBox checkBox && checkBox.Tag is AudioTrackOption audio)
+        {
+            audio.MuteInOutput = checkBox.IsChecked == true;
+            if (audio.MuteInOutput && audio.ExcludeFromOutput)
+            {
+                audio.ExcludeFromOutput = false;
+                PopulateAudioTrackControls();
+            }
         }
     }
 
@@ -1031,15 +1237,40 @@ public partial class MainWindow : Window
     {
         foreach (var button in AudioTracksPanel.Children
             .OfType<Border>()
-            .Select(border => border.Child)
-            .OfType<StackPanel>()
-            .SelectMany(panel => panel.Children.OfType<Button>()))
+            .SelectMany(GetAudioTrackButtons))
         {
             var isSelected = button.Tag is AudioTrackOption audio
                 && _selectedAudioTrackDisplayIndex == audio.DisplayIndex;
             button.FontWeight = isSelected ? FontWeights.SemiBold : FontWeights.Normal;
             button.Background = isSelected ? SystemColors.HighlightBrush : SystemColors.ControlBrush;
             button.Foreground = isSelected ? SystemColors.HighlightTextBrush : SystemColors.ControlTextBrush;
+        }
+    }
+
+    private static IEnumerable<Button> GetAudioTrackButtons(UIElement element)
+    {
+        if (element is Button button)
+        {
+            yield return button;
+        }
+
+        if (element is Border { Child: UIElement borderChild })
+        {
+            foreach (var childButton in GetAudioTrackButtons(borderChild))
+            {
+                yield return childButton;
+            }
+        }
+
+        if (element is Panel panel)
+        {
+            foreach (UIElement panelChild in panel.Children)
+            {
+                foreach (var childButton in GetAudioTrackButtons(panelChild))
+                {
+                    yield return childButton;
+                }
+            }
         }
     }
 
@@ -1150,14 +1381,59 @@ public partial class MainWindow : Window
 
     private TimeSpan GetCurrentTime()
     {
-        var milliseconds = Math.Max(0, _mediaPlayer.Time);
-        return ClampTime(TimeSpan.FromMilliseconds(milliseconds));
+        return GetDisplayTime();
+    }
+
+    private TimeSpan GetDisplayTime()
+    {
+        if (_isPlaybackPaused)
+        {
+            return ClampTime(_displayTimeBase);
+        }
+
+        return ClampTime(_displayTimeBase + (_playbackClock.Elapsed - _displayClockBase));
+    }
+
+    private void ResetDisplayClock(TimeSpan time)
+    {
+        _displayTimeBase = ClampTime(time);
+        _displayClockBase = _playbackClock.Elapsed;
+        _lastVlcSyncClock = _displayClockBase;
+    }
+
+    private void SyncDisplayClockFromVlc(bool force)
+    {
+        if (_inputPath is null)
+        {
+            return;
+        }
+
+        var now = _playbackClock.Elapsed;
+        if (!force && now - _lastVlcSyncClock < TimeSpan.FromMilliseconds(250))
+        {
+            return;
+        }
+
+        var vlcTime = ClampTime(TimeSpan.FromMilliseconds(Math.Max(0, _mediaPlayer.Time)));
+        var displayTime = GetDisplayTime();
+        if (force || Math.Abs((vlcTime - displayTime).TotalMilliseconds) > 250)
+        {
+            _displayTimeBase = vlcTime;
+            _displayClockBase = now;
+        }
+
+        _lastVlcSyncClock = now;
     }
 
     private bool IsAtPlaybackEnd()
     {
+        return IsAtPlaybackEnd(GetCurrentTime());
+    }
+
+    private bool IsAtPlaybackEnd(TimeSpan time)
+    {
         return _duration > TimeSpan.Zero
-            && _duration - GetCurrentTime() <= TimeSpan.FromMilliseconds(300);
+            && _duration - time <= TimeSpan.FromMilliseconds(300);
     }
 
     private TimeSpan GetSeekStep()
@@ -1185,8 +1461,45 @@ public partial class MainWindow : Window
     private void SeekTo(TimeSpan target)
     {
         target = ClampTime(target);
+        if ((_isPlaybackEnded || _mediaPlayer.State == VLCState.Ended) && !IsAtPlaybackEnd(target))
+        {
+            RestartPlaybackFrom(target);
+            return;
+        }
+
         var milliseconds = (long)Math.Round(target.TotalMilliseconds);
+
         _mediaPlayer.Time = milliseconds;
+        ResetDisplayClock(target);
+        CurrentTimeText.Text = FormatTime(target);
+
+        _isUpdatingTimeline = true;
+        TimelineSlider.Value = Math.Clamp(target.TotalMilliseconds, TimelineSlider.Minimum, TimelineSlider.Maximum);
+        _isUpdatingTimeline = false;
+    }
+
+    private void RestartPlaybackFrom(TimeSpan target)
+    {
+        if (_inputPath is null)
+        {
+            return;
+        }
+
+        target = ClampTime(target);
+        using var media = new VlcMedia(_libVlc, new Uri(_inputPath));
+        _mediaPlayer.Play(media);
+        _mediaPlayer.Time = (long)Math.Round(target.TotalMilliseconds);
+        ResetDisplayClock(target);
+        _isPlaybackEnded = false;
+        _isPlaybackPaused = false;
+        _mediaPlayer.SetPause(false);
+        if (_audioTrackOptions.Count > 0)
+        {
+            ApplySelectedAudioTrack();
+        }
+
+        ApplyAudioPlaybackStateOrdered(syncTime: true);
+        PlayPauseButton.Content = "일시정지";
         CurrentTimeText.Text = FormatTime(target);
 
         _isUpdatingTimeline = true;
@@ -1215,15 +1528,18 @@ public partial class MainWindow : Window
         CutProgressBar.Value = 0;
     }
 
-    private void UpdateCutProgress(double percent, TimeSpan elapsed, TimeSpan? remaining)
+    private void UpdateCutProgress(double percent, TimeSpan elapsed, TimeSpan? remaining, string? title = null)
     {
         percent = Math.Clamp(percent, 0, 100);
         var remainingText = remaining.HasValue ? FormatClock(remaining.Value) : "계산 중";
-        CutProgressText.Text = $"진행률 {percent:0.0}% | 소요 {FormatClock(elapsed)} | 남은 {remainingText}";
+        var progressText = $"진행률 {percent:0.0}% | 소요 {FormatClock(elapsed)} | 남은 {remainingText}";
+        CutProgressText.Text = string.IsNullOrWhiteSpace(title)
+            ? progressText
+            : $"{title}\n{progressText}";
         CutProgressBar.Value = percent;
     }
 
-    private void ReportCutProgress(double encodedSeconds, TimeSpan totalDuration, Stopwatch stopwatch)
+    private void ReportCutProgress(double encodedSeconds, TimeSpan totalDuration, Stopwatch stopwatch, string? title)
     {
         if (totalDuration <= TimeSpan.Zero)
         {
@@ -1238,14 +1554,132 @@ public partial class MainWindow : Window
             remaining = TimeSpan.FromSeconds(Math.Max(0, remainingSeconds));
         }
 
-        Dispatcher.BeginInvoke(() => UpdateCutProgress(percent, stopwatch.Elapsed, remaining));
+        Dispatcher.BeginInvoke(() => UpdateCutProgress(percent, stopwatch.Elapsed, remaining, title));
+    }
+
+    private CutJob[] BuildCutJobs(string outputPath)
+    {
+        if (CurrentCutMode == CutMode.Split)
+        {
+            if (!TryReadSplitPoint(out var splitPoint))
+            {
+                return Array.Empty<CutJob>();
+            }
+
+            return new[]
+            {
+                new CutJob(TimeSpan.Zero, splitPoint, GetAvailableOutputPath(BuildPartOutputPath(outputPath, 1))),
+                new CutJob(splitPoint, _duration - splitPoint, GetAvailableOutputPath(BuildPartOutputPath(outputPath, 2)))
+            };
+        }
+
+        if (!TryReadTrimRange(out var start, out var end) || end <= start)
+        {
+            return Array.Empty<CutJob>();
+        }
+
+        return new[]
+        {
+            new CutJob(start, end - start, GetAvailableOutputPath(outputPath))
+        };
+    }
+
+    private static List<string> BuildFfmpegCutArguments(
+        string inputPath,
+        TimeSpan start,
+        TimeSpan trimDuration,
+        string outputPath,
+        IEnumerable<AudioTrackOption> audioTracks)
+    {
+        var audioTrackOptions = audioTracks.ToArray();
+        var excludedAudioTracks = audioTrackOptions
+            .Where(track => track.ExcludeFromOutput)
+            .ToArray();
+        var mutedAudioTracks = audioTrackOptions
+            .Where(track => track.MuteInOutput && !track.ExcludeFromOutput)
+            .ToArray();
+        var args = new List<string>
+        {
+            "-hide_banner",
+            "-nostdin",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-y",
+            "-ss",
+            ToFfmpegTime(start),
+            "-i",
+            inputPath,
+            "-t",
+            ToFfmpegTime(trimDuration)
+        };
+
+        if (mutedAudioTracks.Length > 0)
+        {
+            args.Add("-filter_complex");
+            args.Add(string.Join(";", mutedAudioTracks.Select(track =>
+                $"[0:a:{track.DisplayIndex - 1}]volume=0[{GetMutedAudioLabel(track)}]")));
+        }
+
+        args.AddRange(new[]
+        {
+            "-map",
+            "0"
+        });
+
+        foreach (var audioTrack in excludedAudioTracks)
+        {
+            args.Add("-map");
+            args.Add($"-0:a:{audioTrack.DisplayIndex - 1}");
+        }
+
+        foreach (var audioTrack in mutedAudioTracks)
+        {
+            args.Add("-map");
+            args.Add($"-0:a:{audioTrack.DisplayIndex - 1}");
+        }
+
+        foreach (var audioTrack in mutedAudioTracks)
+        {
+            args.Add("-map");
+            args.Add($"[{GetMutedAudioLabel(audioTrack)}]");
+        }
+
+        args.AddRange(new[]
+        {
+            "-c",
+            "copy"
+        });
+
+        var copiedAudioTrackCount = audioTrackOptions
+            .Count(track => !track.ExcludeFromOutput && !track.MuteInOutput);
+        for (var index = 0; index < mutedAudioTracks.Length; index++)
+        {
+            args.Add($"-c:a:{copiedAudioTrackCount + index}");
+            args.Add("aac");
+        }
+
+        args.AddRange(new[]
+        {
+            "-avoid_negative_ts",
+            "make_zero",
+            outputPath
+        });
+
+        return args;
+    }
+
+    private static string GetMutedAudioLabel(AudioTrackOption audioTrack)
+    {
+        return $"muted_audio_{audioTrack.DisplayIndex}";
     }
 
     private async Task<ProcessResult> RunFfmpegCutAsync(
         string fileName,
         IEnumerable<string> arguments,
         TimeSpan totalDuration,
-        Stopwatch stopwatch)
+        Stopwatch stopwatch,
+        string? progressTitle)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -1265,7 +1699,7 @@ public partial class MainWindow : Window
             ?? throw new InvalidOperationException($"{fileName} 실행에 실패했습니다.");
 
         var errorTask = process.StandardError.ReadToEndAsync();
-        var progressTask = ReadProgressAsync(process, totalDuration, stopwatch);
+        var progressTask = ReadProgressAsync(process, totalDuration, stopwatch, progressTitle);
 
         await process.WaitForExitAsync();
         await progressTask;
@@ -1274,17 +1708,17 @@ public partial class MainWindow : Window
         return new ProcessResult(process.ExitCode, "", error.Trim());
     }
 
-    private async Task ReadProgressAsync(Process process, TimeSpan totalDuration, Stopwatch stopwatch)
+    private async Task ReadProgressAsync(Process process, TimeSpan totalDuration, Stopwatch stopwatch, string? progressTitle)
     {
         while (await process.StandardOutput.ReadLineAsync() is { } line)
         {
             if (TryParseProgressSeconds(line, out var seconds))
             {
-                ReportCutProgress(seconds, totalDuration, stopwatch);
+                ReportCutProgress(seconds, totalDuration, stopwatch, progressTitle);
             }
             else if (line.Equals("progress=end", StringComparison.OrdinalIgnoreCase))
             {
-                ReportCutProgress(totalDuration.TotalSeconds, totalDuration, stopwatch);
+                ReportCutProgress(totalDuration.TotalSeconds, totalDuration, stopwatch, progressTitle);
             }
         }
     }
@@ -1336,6 +1770,15 @@ public partial class MainWindow : Window
         }
 
         return GetAvailableOutputPath(Path.Combine(directory, $"{name}_cut{extension}"));
+    }
+
+    private static string BuildPartOutputPath(string outputPath, int partNumber)
+    {
+        var directory = Path.GetDirectoryName(outputPath) ?? "";
+        var name = Path.GetFileNameWithoutExtension(outputPath);
+        var extension = Path.GetExtension(outputPath);
+
+        return Path.Combine(directory, $"{name}_part{partNumber}{extension}");
     }
 
     private static string GetAvailableOutputPath(string path)
@@ -1511,7 +1954,11 @@ public partial class MainWindow : Window
         public string Name { get; }
 
         public bool ExcludeFromOutput { get; set; }
+
+        public bool MuteInOutput { get; set; }
     }
 
     private sealed record ProcessResult(int ExitCode, string Output, string Error);
+
+    private sealed record CutJob(TimeSpan Start, TimeSpan Duration, string OutputPath);
 }

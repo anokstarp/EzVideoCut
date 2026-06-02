@@ -63,15 +63,24 @@
                     Background="#101317"
                     BorderBrush="#D9DEE7"
                     BorderThickness="1"
+                    SizeChanged="VideoHost_SizeChanged"
                     PreviewMouseDown="VideoHost_PreviewMouseDown">
                 <Grid>
-                    <vlc:VideoView x:Name="VideoView" />
-                    <TextBlock x:Name="EmptyVideoText"
-                               Text="비디오를 선택하면 이곳에서 재생됩니다"
-                               Foreground="#D4DAE3"
-                               FontSize="18"
-                               HorizontalAlignment="Center"
-                               VerticalAlignment="Center" />
+                    <Border x:Name="VideoSurface"
+                            Background="#101317"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center">
+                        <Grid>
+                            <vlc:VideoView x:Name="VideoView"
+                                           Visibility="Collapsed" />
+                            <TextBlock x:Name="EmptyVideoText"
+                                       Text="비디오를 선택하면 이곳에서 재생됩니다"
+                                       Foreground="#D4DAE3"
+                                       FontSize="18"
+                                       HorizontalAlignment="Center"
+                                       VerticalAlignment="Center" />
+                        </Grid>
+                    </Border>
                 </Grid>
             </Border>
 
@@ -91,9 +100,16 @@
                         <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
 
-                    <TextBlock Text="구간 설정" FontSize="20" FontWeight="SemiBold" />
+                    <TabControl x:Name="CutModeTabs"
+                                SelectedIndex="0"
+                                SelectionChanged="CutModeTabs_SelectionChanged">
+                        <TabItem Header="지점 분할" />
+                        <TabItem Header="범위 자르기" />
+                    </TabControl>
 
-                    <Grid Grid.Row="1" Margin="0,18,0,0">
+                    <Grid Grid.Row="1"
+                          x:Name="RangeStartGrid"
+                          Margin="0,18,0,0">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
@@ -118,7 +134,37 @@
                                 IsEnabled="False" />
                     </Grid>
 
-                    <Grid Grid.Row="2" Margin="0,14,0,0">
+                    <Grid Grid.Row="1"
+                          x:Name="SplitPointGrid"
+                          Margin="0,18,0,0"
+                          Visibility="Collapsed">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel>
+                            <TextBlock Text="분할 지점" FontWeight="SemiBold" />
+                            <TextBox x:Name="SplitTextBox"
+                                     Text="00:00:00.000"
+                                     MaxLength="9"
+                                     LostFocus="TimeTextBox_LostFocus"
+                                     KeyDown="TimeTextBox_KeyDown"
+                                     PreviewTextInput="TimeTextBox_PreviewTextInput"
+                                     GotKeyboardFocus="TimeTextBox_GotKeyboardFocus"
+                                     PreviewMouseDown="TimeTextBox_PreviewMouseDown"
+                                     Margin="0,6,0,0" />
+                        </StackPanel>
+                        <Button Grid.Column="1"
+                                x:Name="SetSplitButton"
+                                Content="현재 위치"
+                                Click="SetSplitButton_Click"
+                                Margin="10,22,0,0"
+                                IsEnabled="False" />
+                    </Grid>
+
+                    <Grid Grid.Row="2"
+                          x:Name="RangeEndGrid"
+                          Margin="0,14,0,0">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
@@ -146,7 +192,7 @@
                     <StackPanel Grid.Row="3" Margin="0,18,0,0">
                         <TextBlock Text="출력 파일" FontWeight="SemiBold" />
                         <Border Margin="0,6,0,0"
-                                Height="32"
+                                MinHeight="32"
                                 Padding="8,5"
                                 BorderBrush="#ABADB3"
                                 BorderThickness="1"
@@ -155,7 +201,7 @@
                                        Text=""
                                        HorizontalAlignment="Left"
                                        TextAlignment="Left"
-                                       TextTrimming="CharacterEllipsis"
+                                       TextWrapping="Wrap"
                                        VerticalAlignment="Center" />
                         </Border>
                         <Grid Margin="0,10,0,0">
@@ -222,12 +268,12 @@
                             Width="72"
                             IsEnabled="False" />
                     <TextBlock Grid.Column="1"
-                               Text="이동"
+                               Text="이동간격"
                                VerticalAlignment="Center"
                                Margin="14,0,0,0" />
                     <ComboBox Grid.Column="2"
                               x:Name="SeekStepComboBox"
-                              Width="78"
+                              Width="86"
                               SelectedIndex="2"
                               Margin="8,0,0,0"
                               VerticalAlignment="Center"
@@ -237,6 +283,9 @@
                         <ComboBoxItem Content="5초" Tag="5" />
                         <ComboBoxItem Content="10초" Tag="10" />
                         <ComboBoxItem Content="30초" Tag="30" />
+                        <ComboBoxItem Content="1분" Tag="60" />
+                        <ComboBoxItem Content="3분" Tag="180" />
+                        <ComboBoxItem Content="5분" Tag="300" />
                     </ComboBox>
                     <TextBlock Grid.Column="3"
                                Text="음량"
@@ -269,6 +318,7 @@
                             Maximum="1"
                             ValueChanged="TimelineSlider_ValueChanged"
                             PreviewMouseDown="TimelineSlider_PreviewMouseDown"
+                            PreviewMouseMove="TimelineSlider_PreviewMouseMove"
                             PreviewMouseUp="TimelineSlider_PreviewMouseUp"
                             IsEnabled="False"
                             VerticalAlignment="Center"
