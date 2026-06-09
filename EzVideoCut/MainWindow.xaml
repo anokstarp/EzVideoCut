@@ -1117,14 +1117,25 @@
                                Foreground="#6B7280"
                                VerticalAlignment="Center" />
                 </DockPanel>
-                <CheckBox Grid.Row="1"
-                          x:Name="MixAudioTracksCheckBox"
-                          Content="오디오 트랙 1개로 믹싱"
-                          Margin="0,8,0,0"
-                          VerticalAlignment="Center"
-                          Checked="MixAudioTracksCheckBox_Changed"
-                          Unchecked="MixAudioTracksCheckBox_Changed"
-                          ToolTip="제거하지 않은 오디오 트랙들을 하나의 AAC 오디오 트랙으로 합칩니다." />
+                <StackPanel Grid.Row="1"
+                            Margin="0,8,0,0"
+                            Orientation="Horizontal">
+                    <CheckBox x:Name="MixAudioTracksCheckBox"
+                              Content="오디오 트랙 1개로 믹싱"
+                              VerticalAlignment="Center"
+                              HorizontalAlignment="Left"
+                              Checked="MixAudioTracksCheckBox_Changed"
+                              Unchecked="MixAudioTracksCheckBox_Changed"
+                              ToolTip="제거하지 않은 오디오 트랙들을 하나의 AAC 오디오 트랙으로 합칩니다." />
+                    <CheckBox x:Name="DisableAudioLimiterCheckBox"
+                              Content="리미터 없이 합치기"
+                              Margin="14,0,0,0"
+                              VerticalAlignment="Center"
+                              HorizontalAlignment="Left"
+                              Checked="DisableAudioLimiterCheckBox_Changed"
+                              Unchecked="DisableAudioLimiterCheckBox_Changed"
+                              ToolTip="오디오 트랙을 그대로 더하고 피크 제한을 적용하지 않습니다." />
+                </StackPanel>
                 <ScrollViewer Grid.Row="2"
                               Margin="0,8,0,0"
                               HorizontalScrollBarVisibility="Auto"

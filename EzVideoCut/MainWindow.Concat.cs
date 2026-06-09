@@ -218,7 +218,7 @@ public partial class MainWindow
                 FfmpegService.BuildConcatListLines(_concatClips),
                 new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
 
-            var args = FfmpegService.BuildConcatArguments(concatListPath, _outputPath!, _audioTrackOptions, _mixAudioTracksToSingleTrack);
+            var args = FfmpegService.BuildConcatArguments(concatListPath, _outputPath!, _audioTrackOptions, _mixAudioTracksToSingleTrack, _disableAudioLimiter);
             StatusText.Text = hasMixedAudioTracks
                 ? "ffmpeg copy 이어 붙이기와 오디오 믹싱을 실행 중입니다."
                 : "ffmpeg copy 이어 붙이기를 실행 중입니다.";

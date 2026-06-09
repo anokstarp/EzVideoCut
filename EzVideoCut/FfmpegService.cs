@@ -10,7 +10,8 @@ internal static class FfmpegService
         string concatListPath,
         string outputPath,
         IEnumerable<AudioTrackOption> audioTracks,
-        bool mixAudioTracks)
+        bool mixAudioTracks,
+        bool disableAudioLimiter)
     {
         var audioTrackOptions = audioTracks.ToArray();
         var args = new List<string>
@@ -29,7 +30,7 @@ internal static class FfmpegService
             concatListPath
         };
 
-        AddAudioMixFilterArguments(args, audioTrackOptions, mixAudioTracks);
+        AddAudioMixFilterArguments(args, audioTrackOptions, mixAudioTracks, disableAudioLimiter);
         AddOutputStreamMapArguments(args, audioTrackOptions, mixAudioTracks);
 
         args.AddRange(new[]
@@ -56,7 +57,8 @@ internal static class FfmpegService
         TimeSpan trimDuration,
         string outputPath,
         IEnumerable<AudioTrackOption> audioTracks,
-        bool mixAudioTracks)
+        bool mixAudioTracks,
+        bool disableAudioLimiter)
     {
         var audioTrackOptions = audioTracks.ToArray();
         var args = new List<string>
@@ -75,7 +77,7 @@ internal static class FfmpegService
             ToFfmpegTime(trimDuration)
         };
 
-        AddAudioMixFilterArguments(args, audioTrackOptions, mixAudioTracks);
+        AddAudioMixFilterArguments(args, audioTrackOptions, mixAudioTracks, disableAudioLimiter);
         AddOutputStreamMapArguments(args, audioTrackOptions, mixAudioTracks);
 
         args.AddRange(new[]
@@ -252,7 +254,7 @@ internal static class FfmpegService
         return false;
     }
 
-    private static void AddAudioMixFilterArguments(List<string> args, AudioTrackOption[] audioTrackOptions, bool mixAudioTracks)
+    private static void AddAudioMixFilterArguments(List<string> args, AudioTrackOption[] audioTrackOptions, bool mixAudioTracks, bool disableAudioLimiter)
     {
         var includedAudioTracks = GetIncludedAudioTracks(audioTrackOptions);
         if (!mixAudioTracks || includedAudioTracks.Length <= 1)
@@ -260,10 +262,16 @@ internal static class FfmpegService
             return;
         }
 
+        var mixFilter = $"amix=inputs={includedAudioTracks.Length}:duration=longest:normalize=0";
+        if (!disableAudioLimiter)
+        {
+            mixFilter += ",alimiter=limit=0.98";
+        }
+
         args.Add("-filter_complex");
         args.Add(
             $"{string.Concat(includedAudioTracks.Select(track => $"[0:a:{track.DisplayIndex - 1}]"))}" +
-            $"amix=inputs={includedAudioTracks.Length}:duration=longest:normalize=0,alimiter=limit=0.98[{GetMixedAudioLabel()}]");
+            $"{mixFilter}[{GetMixedAudioLabel()}]");
     }
 
     private static void AddOutputStreamMapArguments(List<string> args, AudioTrackOption[] audioTrackOptions, bool mixAudioTracks)

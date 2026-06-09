@@ -59,6 +59,7 @@ public partial class MainWindow : Window
     private int _concatPreviewLoadVersion;
     private int _masterVolume = 100;
     private bool _mixAudioTracksToSingleTrack;
+    private bool _disableAudioLimiter;
     public MainWindow()
     {
         InitializeComponent();
@@ -719,7 +720,7 @@ public partial class MainWindow : Window
                     ? $"{index + 1}/{cutJobs.Length} part{index + 1} 생성 중"
                     : null;
                 UpdateCutProgress(0, stopwatch.Elapsed, null, progressTitle);
-                var args = FfmpegService.BuildCutArguments(_inputPath, job.Start, job.Duration, job.OutputPath, _audioTrackOptions, _mixAudioTracksToSingleTrack);
+                var args = FfmpegService.BuildCutArguments(_inputPath, job.Start, job.Duration, job.OutputPath, _audioTrackOptions, _mixAudioTracksToSingleTrack, _disableAudioLimiter);
                 var result = await FfmpegService.RunFfmpegAsync(FfmpegService.ResolveToolPath("ffmpeg.exe"), args, job.Duration, stopwatch, progressTitle, ReportCutProgress);
                 if (result.ExitCode != 0)
                 {
@@ -1100,6 +1101,7 @@ public partial class MainWindow : Window
         };
         AudioTrackHost.Visibility = Visibility.Visible;
         MixAudioTracksCheckBox.Visibility = audioExtractMode ? Visibility.Collapsed : Visibility.Visible;
+        DisableAudioLimiterCheckBox.Visibility = audioExtractMode ? Visibility.Collapsed : Visibility.Visible;
 
         _duration = concatMode ? GetConcatTotalDuration() : _singleInputDuration;
         DurationText.Text = FormatTime(_duration);
@@ -1255,18 +1257,26 @@ public partial class MainWindow : Window
     private void MixAudioTracksCheckBox_Changed(object sender, RoutedEventArgs e)
     {
         _mixAudioTracksToSingleTrack = MixAudioTracksCheckBox.IsChecked == true;
+        UpdateAudioMixOptionState();
+    }
+
+    private void DisableAudioLimiterCheckBox_Changed(object sender, RoutedEventArgs e)
+    {
+        _disableAudioLimiter = DisableAudioLimiterCheckBox.IsChecked == true;
     }
 
     private void UpdateAudioMixOptionState()
     {
-        if (MixAudioTracksCheckBox is null)
+        if (MixAudioTracksCheckBox is null || DisableAudioLimiterCheckBox is null)
         {
             return;
         }
 
-        MixAudioTracksCheckBox.IsEnabled = CurrentCutMode != CutMode.AudioExtract
+        var canMix = CurrentCutMode != CutMode.AudioExtract
             && !_isCutting
             && _audioTrackOptions.Count(audio => !audio.ExcludeFromOutput) > 1;
+        MixAudioTracksCheckBox.IsEnabled = canMix;
+        DisableAudioLimiterCheckBox.IsEnabled = canMix && _mixAudioTracksToSingleTrack;
     }
 
     private bool ShouldMixAudioTracks()
