@@ -1,15 +1,19 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Text;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
 using LibVLCSharp.Shared;
 using Microsoft.Win32;
+using Polygon = System.Windows.Shapes.Polygon;
+using Rectangle = System.Windows.Shapes.Rectangle;
 using VlcMedia = LibVLCSharp.Shared.Media;
 using VlcMediaPlayer = LibVLCSharp.Shared.MediaPlayer;
 
@@ -20,7 +24,9 @@ public partial class MainWindow : Window
     private enum CutMode
     {
         Range,
-        Split
+        Split,
+        AudioExtract,
+        Concat
     }
 
     private readonly DispatcherTimer _positionTimer;
@@ -28,37 +34,46 @@ public partial class MainWindow : Window
     private readonly VlcMediaPlayer _mediaPlayer;
     private readonly List<AdditionalAudioPlayer> _additionalAudioPlayers = new();
     private readonly List<AudioTrackOption> _audioTrackOptions = new();
+    private readonly List<ConcatClip> _concatClips = new();
     private readonly Stopwatch _playbackClock = Stopwatch.StartNew();
 
     private string? _inputPath;
     private string? _outputPath;
     private TimeSpan _duration = TimeSpan.Zero;
+    private TimeSpan _singleInputDuration = TimeSpan.Zero;
+    private TimeSpan _concatModePosition = TimeSpan.Zero;
     private TimeSpan _displayTimeBase = TimeSpan.Zero;
     private TimeSpan _displayClockBase = TimeSpan.Zero;
     private TimeSpan _lastVlcSyncClock = TimeSpan.Zero;
     private bool _controlsEnabled;
     private bool _isCutting;
     private bool _isDraggingTimeline;
+    private bool _isDraggingVolume;
     private bool _isUpdatingTimeline;
     private bool _isPlaybackPaused = true;
     private bool _isPlaybackEnded;
+    private CutMode _activeCutMode = CutMode.Split;
+    private int _currentConcatClipIndex = -1;
     private int? _selectedAudioTrackDisplayIndex;
     private int _audioPlaybackStateVersion;
+    private int _concatPreviewLoadVersion;
     private int _masterVolume = 100;
-
+    private bool _mixAudioTracksToSingleTrack;
     public MainWindow()
     {
         InitializeComponent();
+        _activeCutMode = CurrentCutMode;
         UpdateCutModeVisibility();
-        AudioTrackHelpText.Text = string.Empty;
+        SetInputPathDisplay(null);
+        ShowAudioTrackPlaceholder("비디오를 선택하면 표시됩니다.");
 
         Core.Initialize();
         _libVlc = new LibVLC("--no-video-title-show");
         _masterVolume = (int)VolumeSlider.Value;
         _mediaPlayer = new VlcMediaPlayer(_libVlc)
         {
-            Volume = 0,
-            Mute = true
+            Volume = _masterVolume,
+            Mute = _masterVolume <= 0
         };
         VideoView.MediaPlayer = _mediaPlayer;
 
@@ -76,11 +91,22 @@ public partial class MainWindow : Window
         Closed += MainWindow_Closed;
     }
 
-    private CutMode CurrentCutMode => CutModeTabs.SelectedIndex == 0 ? CutMode.Split : CutMode.Range;
+    private CutMode CurrentCutMode => CutModeTabs.SelectedIndex switch
+    {
+        0 => CutMode.Split,
+        1 => CutMode.Range,
+        2 => CutMode.AudioExtract,
+        3 => CutMode.Concat,
+        _ => CutMode.Split
+    };
+
+    private bool HasPlayableInput => CurrentCutMode == CutMode.Concat
+        ? _concatClips.Count > 0
+        : _inputPath is not null;
 
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
-        if (_inputPath is null || e.Key is not Key.Left and not Key.Right and not Key.Space)
+        if (!HasPlayableInput || e.Key is not Key.Left and not Key.Right and not Key.Space)
         {
             return;
         }
@@ -106,7 +132,7 @@ public partial class MainWindow : Window
     {
         const int wmKeyDown = 0x0100;
 
-        if (handled || !IsActive || _inputPath is null || msg.message != wmKeyDown)
+        if (handled || !IsActive || !HasPlayableInput || msg.message != wmKeyDown)
         {
             return;
         }
@@ -142,9 +168,14 @@ public partial class MainWindow : Window
 
     private void VideoHost_SizeChanged(object sender, SizeChangedEventArgs e)
     {
+        ApplyVideoSurfaceSize(e.NewSize);
+    }
+
+    private void ApplyVideoSurfaceSize(Size hostSize)
+    {
         const double aspectRatio = 16d / 9d;
-        var availableWidth = Math.Max(0, e.NewSize.Width - VideoHost.BorderThickness.Left - VideoHost.BorderThickness.Right);
-        var availableHeight = Math.Max(0, e.NewSize.Height - VideoHost.BorderThickness.Top - VideoHost.BorderThickness.Bottom);
+        var availableWidth = Math.Max(0, hostSize.Width - VideoHost.BorderThickness.Left - VideoHost.BorderThickness.Right);
+        var availableHeight = Math.Max(0, hostSize.Height - VideoHost.BorderThickness.Top - VideoHost.BorderThickness.Bottom);
         var width = availableWidth;
         var height = width / aspectRatio;
 
@@ -171,11 +202,16 @@ public partial class MainWindow : Window
             return;
         }
 
-        _inputPath = dialog.FileName;
+        await LoadSingleVideoAsync(dialog.FileName);
+    }
 
+    private async Task LoadSingleVideoAsync(string inputPath)
+    {
+        _inputPath = inputPath;
+        _currentConcatClipIndex = -1;
         ClearAudioTrackOptions();
-        FileNameText.Text = Path.GetFileName(_inputPath);
-        SetOutputPath(BuildDefaultOutputPath(_inputPath));
+        SetInputPathDisplay(_inputPath);
+        RefreshDefaultOutputPathForCurrentMode();
         ResetCutProgress();
         StatusText.Text = "영상 정보를 읽는 중...";
 
@@ -183,7 +219,11 @@ public partial class MainWindow : Window
 
         try
         {
-            _duration = await ProbeDurationAsync(_inputPath);
+            var duration = await ProbeDurationAsync(_inputPath);
+            await Dispatcher.InvokeAsync(() =>
+            {
+            _singleInputDuration = duration;
+            _duration = _singleInputDuration;
             DurationText.Text = FormatTime(_duration);
             CurrentTimeText.Text = FormatTime(TimeSpan.Zero);
             TimelineSlider.Maximum = Math.Max(1, _duration.TotalMilliseconds);
@@ -206,13 +246,17 @@ public partial class MainWindow : Window
 
             PlayPauseButton.Content = "재생";
             SetControlsEnabled(true);
+            });
             await StartAdditionalAudioTracksAsync();
+            await Dispatcher.InvokeAsync(() =>
+            {
             _isPlaybackPaused = false;
             _mediaPlayer.SetPause(false);
             ResetDisplayClock(TimeSpan.FromMilliseconds(Math.Max(0, _mediaPlayer.Time)));
             ApplySelectedAudioTrack();
             PlayPauseButton.Content = "?쇱떆?뺤?";
             StatusText.Text = "영상이 열렸습니다.";
+            });
         }
         catch (Exception ex)
         {
@@ -231,32 +275,43 @@ public partial class MainWindow : Window
 
     private void TogglePlayback()
     {
-        if (_inputPath is null)
+        if (!HasPlayableInput)
         {
             return;
         }
 
         if (!_isPlaybackPaused)
         {
+            SyncDisplayClockFromVlc(force: true);
+            var pauseTime = GetCurrentTime();
+            _mediaPlayer.SetPause(true);
             _isPlaybackPaused = true;
             _isPlaybackEnded = false;
-            _mediaPlayer.SetPause(true);
-            SyncDisplayClockFromVlc(force: true);
+            ResetDisplayClock(pauseTime);
             PlayPauseButton.Content = "재생";
         }
         else
         {
-            if (IsAtPlaybackEnd())
+            var resumeTime = GetCurrentTime();
+            if (IsAtPlaybackEnd(resumeTime))
             {
                 RestartPlaybackFrom(TimeSpan.Zero);
                 return;
             }
 
-            _mediaPlayer.Play();
+            if (CurrentCutMode == CutMode.Concat)
+            {
+                LoadConcatClipForTime(resumeTime, autoPlay: true);
+            }
+            else
+            {
+                _mediaPlayer.Play();
+            }
+
             _mediaPlayer.SetPause(false);
             _isPlaybackPaused = false;
             _isPlaybackEnded = false;
-            ResetDisplayClock(GetCurrentTime());
+            ResetDisplayClock(resumeTime);
             PlayPauseButton.Content = "일시정지";
         }
     }
@@ -286,22 +341,259 @@ public partial class MainWindow : Window
             return;
         }
 
+        var selectedMode = CurrentCutMode;
+        var changedPlaybackGroup = (_activeCutMode == CutMode.Concat) != (selectedMode == CutMode.Concat);
+        if (changedPlaybackGroup)
+        {
+            StoreModePlaybackPosition(_activeCutMode);
+            StopPlaybackForModeSwitch();
+        }
+
+        _activeCutMode = selectedMode;
         UpdateCutModeVisibility();
+        RefreshDefaultOutputPathForCurrentMode();
+
+        if (changedPlaybackGroup)
+        {
+            ApplyPlaybackSurfaceForCurrentMode();
+        }
+    }
+
+    private void StoreModePlaybackPosition(CutMode mode)
+    {
+        if (mode == CutMode.Concat)
+        {
+            _concatModePosition = ClampToDuration(GetDisplayTime(), GetConcatTotalDuration());
+        }
+    }
+
+    private void StopPlaybackForModeSwitch()
+    {
+        _mediaPlayer.SetPause(true);
+        _mediaPlayer.Stop();
+        DisposeAdditionalAudioPlayers();
+        ClearAudioTrackOptions();
+        _currentConcatClipIndex = -1;
+        _isPlaybackPaused = true;
+        _isPlaybackEnded = false;
+        PlayPauseButton.Content = "재생";
+    }
+
+    private void ApplyPlaybackSurfaceForCurrentMode()
+    {
+        if (CurrentCutMode == CutMode.Concat)
+        {
+            ShowConcatPlaybackSurface();
+            return;
+        }
+
+        ShowSingleCutPlaceholder();
+    }
+
+    private void ShowConcatPlaybackSurface()
+    {
+        _duration = GetConcatTotalDuration();
+        DurationText.Text = FormatTime(_duration);
+        TimelineSlider.Maximum = Math.Max(1, _duration.TotalMilliseconds);
+
+        if (_concatClips.Count == 0)
+        {
+            ShowEmptyVideoSurface();
+            SetControlsEnabled(false);
+            return;
+        }
+
+        RefreshDefaultOutputPathForCurrentMode();
+
+        var target = ClampToDuration(_concatModePosition, _duration);
+        if (_duration > TimeSpan.Zero && _duration - target <= GetPlaybackEndTolerance())
+        {
+            target = TimeSpan.Zero;
+        }
+
+        SetConcatTimelinePosition(target);
+        LoadConcatClipForTime(target, autoPlay: false);
+        SetControlsEnabled(true);
+        _positionTimer.Start();
+    }
+
+    private void ShowSingleCutPlaceholder()
+    {
+        _inputPath = null;
+        _singleInputDuration = TimeSpan.Zero;
+        _duration = TimeSpan.Zero;
+        SetInputPathDisplay(null);
+        ClearAudioTrackOptions();
+        ShowEmptyVideoSurface();
+        ResetCutProgress();
+        SetStartTime(TimeSpan.Zero, adjustEnd: false);
+        SetEndTime(TimeSpan.Zero, adjustStart: false);
+        SetSplitTime(TimeSpan.Zero);
+        SetControlsEnabled(false);
+    }
+
+    private void ShowEmptyVideoSurface()
+    {
+        VideoView.Visibility = Visibility.Collapsed;
+        EmptyVideoText.Text = "비디오를 선택하면 이곳에서 재생됩니다.";
+        EmptyVideoText.Visibility = Visibility.Visible;
+        ResetDisplayClock(TimeSpan.Zero);
+        CurrentTimeText.Text = FormatTime(TimeSpan.Zero);
+        DurationText.Text = FormatTime(_duration);
+        _isUpdatingTimeline = true;
+        TimelineSlider.Maximum = Math.Max(1, _duration.TotalMilliseconds);
+        TimelineSlider.Value = 0;
+        _isUpdatingTimeline = false;
+    }
+
+    private async void AddConcatVideosButton_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new OpenFileDialog
+        {
+            Title = "이어 붙일 영상 선택",
+            Filter = "Video files|*.mp4;*.mov;*.mkv;*.avi;*.webm;*.m4v;*.ts;*.mts;*.m2ts|All files|*.*",
+            Multiselect = true
+        };
+
+        if (dialog.ShowDialog(this) != true || dialog.FileNames.Length == 0)
+        {
+            return;
+        }
+
+        SetControlsEnabled(false);
+        StatusText.Text = "이어 붙일 영상 정보를 읽는 중...";
+
+        try
+        {
+            var firstAddedIndex = _concatClips.Count;
+            foreach (var fileName in dialog.FileNames)
+            {
+                var duration = await ProbeDurationAsync(fileName);
+                _concatClips.Add(new ConcatClip(fileName, duration));
+            }
+
+            RefreshDefaultOutputPathForCurrentMode();
+
+            RefreshConcatClipList(firstAddedIndex);
+            if (CurrentCutMode == CutMode.Concat && _concatClips.Count > 0)
+            {
+                SetConcatTimelinePosition(TimeSpan.Zero);
+                LoadConcatClipForTime(TimeSpan.Zero, autoPlay: false);
+            }
+
+            StatusText.Text = "이어 붙일 영상이 추가되었습니다.";
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"영상 추가 실패: {Shorten(ex.Message)}";
+            MessageBox.Show(this, ex.Message, "영상 추가 실패", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            SetControlsEnabled(HasPlayableInput);
+            ValidateTrimRange();
+        }
+    }
+
+    private void RemoveConcatVideoButton_Click(object sender, RoutedEventArgs e)
+    {
+        var index = ConcatClipsListBox.SelectedIndex;
+        if (index < 0 || index >= _concatClips.Count)
+        {
+            return;
+        }
+
+        var removedPath = _concatClips[index].Path;
+        _concatClips.RemoveAt(index);
+        RefreshConcatClipList(Math.Min(index, _concatClips.Count - 1));
+        RefreshDefaultOutputPathForCurrentMode();
+        if (CurrentCutMode == CutMode.Concat && _concatClips.Count > 0)
+        {
+            SetConcatTimelinePosition(TimeSpan.Zero);
+            LoadConcatClipForTime(TimeSpan.Zero, autoPlay: false);
+        }
+        else if (CurrentCutMode == CutMode.Concat)
+        {
+            StopConcatPlayback();
+        }
+        else if (_inputPath is not null && Path.GetFullPath(_inputPath).Equals(Path.GetFullPath(removedPath), StringComparison.OrdinalIgnoreCase))
+        {
+            ClearSingleVideoSelection();
+        }
+
+        ValidateTrimRange();
+    }
+
+    private void MoveConcatVideoUpButton_Click(object sender, RoutedEventArgs e)
+    {
+        MoveConcatClip(-1);
+    }
+
+    private void MoveConcatVideoDownButton_Click(object sender, RoutedEventArgs e)
+    {
+        MoveConcatClip(1);
+    }
+
+    private void ClearConcatVideosButton_Click(object sender, RoutedEventArgs e)
+    {
+        _concatClips.Clear();
+        RefreshConcatClipList();
+        if (CurrentCutMode == CutMode.Concat)
+        {
+            StopConcatPlayback();
+        }
+        else
+        {
+            ClearSingleVideoSelection();
+        }
+
+        SetConcatTimelinePosition(TimeSpan.Zero);
+        RefreshDefaultOutputPathForCurrentMode();
+        ValidateTrimRange();
+    }
+
+    private void ConcatClipsListBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        UpdateConcatClipButtonStates();
+    }
+
+    private async void SelectListedVideoButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (CurrentCutMode == CutMode.Concat)
+        {
+            return;
+        }
+
+        var index = ConcatClipsListBox.SelectedIndex;
+        if (index < 0 || index >= _concatClips.Count)
+        {
+            return;
+        }
+
+        await LoadSingleVideoAsync(_concatClips[index].Path);
     }
 
     private void PickOutputButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_inputPath is null)
+        if (_inputPath is null && CurrentCutMode != CutMode.Concat)
         {
             return;
+        }
+
+        var defaultOutputPath = _outputPath;
+        if (string.IsNullOrWhiteSpace(defaultOutputPath) && CurrentCutMode == CutMode.Concat && _concatClips.Count > 0)
+        {
+            defaultOutputPath = OutputPathService.BuildDefaultConcatOutputPath(_concatClips[0].Path);
         }
 
         var dialog = new SaveFileDialog
         {
             Title = "저장 위치 선택",
-            FileName = Path.GetFileName(_outputPath),
-            InitialDirectory = Path.GetDirectoryName(_outputPath),
-            Filter = "MP4 file|*.mp4|MKV file|*.mkv|MOV file|*.mov|All files|*.*",
+            FileName = Path.GetFileName(defaultOutputPath),
+            InitialDirectory = Path.GetDirectoryName(defaultOutputPath),
+            Filter = CurrentCutMode == CutMode.AudioExtract
+                ? "Audio file|*.m4a;*.mp3;*.wav;*.flac;*.ogg;*.opus;*.ac3;*.eac3;*.dts;*.mka|All files|*.*"
+                : "MP4 file|*.mp4|MKV file|*.mkv|MOV file|*.mov|All files|*.*",
             OverwritePrompt = false
         };
 
@@ -310,7 +602,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        SetOutputPath(GetAvailableOutputPath(dialog.FileName));
+        SetOutputPath(OutputPathService.GetAvailableOutputPath(dialog.FileName));
         ValidateTrimRange();
     }
 
@@ -337,7 +629,24 @@ public partial class MainWindow : Window
 
     private async void CutButton_Click(object sender, RoutedEventArgs e)
     {
-        if (_isCutting || _inputPath is null || _outputPath is null)
+        if (_isCutting)
+        {
+            return;
+        }
+
+        if (CurrentCutMode == CutMode.Concat)
+        {
+            await ConcatButton_ClickAsync();
+            return;
+        }
+
+        if (CurrentCutMode == CutMode.AudioExtract)
+        {
+            await ExtractAudioButton_ClickAsync();
+            return;
+        }
+
+        if (_inputPath is null || _outputPath is null)
         {
             return;
         }
@@ -368,14 +677,13 @@ public partial class MainWindow : Window
         var excludedAudioTracks = _audioTrackOptions
             .Where(track => track.ExcludeFromOutput)
             .ToArray();
-        var hasMutedAudioTracks = _audioTrackOptions
-            .Any(track => track.MuteInOutput && !track.ExcludeFromOutput);
+        var hasMixedAudioTracks = ShouldMixAudioTracks();
         if (excludedAudioTracks.Length > 0)
         {
             var trackList = string.Join(", ", excludedAudioTracks.Select(track => $"{track.DisplayIndex}번"));
             var deleteAnswer = MessageBox.Show(
                 this,
-                $"오디오 제거는 음소거가 아니라 출력 파일에서 트랙이 제거됩니다.\n\n제거할 오디오 트랙: {trackList}\n\n계속 진행하시겠습니까?",
+                $"선택한 오디오 트랙은 출력 파일에서 제거됩니다.\n\n제거할 오디오 트랙: {trackList}\n\n계속 진행하시겠습니까?",
                 "오디오 트랙 제거 확인",
                 MessageBoxButton.YesNo,
                 MessageBoxImage.Warning);
@@ -395,8 +703,8 @@ public partial class MainWindow : Window
         _isCutting = true;
         SetControlsEnabled(false);
         CutButton.Content = "자르는 중...";
-        StatusText.Text = hasMutedAudioTracks
-            ? "ffmpeg 컷과 오디오 음소거를 실행 중입니다."
+        StatusText.Text = hasMixedAudioTracks
+            ? "ffmpeg 컷과 오디오 믹싱을 실행 중입니다."
             : "ffmpeg copy 컷을 실행 중입니다.";
 
         var stopwatch = Stopwatch.StartNew();
@@ -411,8 +719,8 @@ public partial class MainWindow : Window
                     ? $"{index + 1}/{cutJobs.Length} part{index + 1} 생성 중"
                     : null;
                 UpdateCutProgress(0, stopwatch.Elapsed, null, progressTitle);
-                var args = BuildFfmpegCutArguments(_inputPath, job.Start, job.Duration, job.OutputPath, _audioTrackOptions);
-                var result = await RunFfmpegCutAsync(ResolveToolPath("ffmpeg.exe"), args, job.Duration, stopwatch, progressTitle);
+                var args = FfmpegService.BuildCutArguments(_inputPath, job.Start, job.Duration, job.OutputPath, _audioTrackOptions, _mixAudioTracksToSingleTrack);
+                var result = await FfmpegService.RunFfmpegAsync(FfmpegService.ResolveToolPath("ffmpeg.exe"), args, job.Duration, stopwatch, progressTitle, ReportCutProgress);
                 if (result.ExitCode != 0)
                 {
                     throw new InvalidOperationException(result.Error.Length > 0 ? result.Error : result.Output);
@@ -425,7 +733,7 @@ public partial class MainWindow : Window
 
             if (CurrentCutMode == CutMode.Range)
             {
-                SetOutputPath(GetAvailableOutputPath(_outputPath));
+                SetOutputPath(OutputPathService.GetAvailableOutputPath(_outputPath));
             }
         }
         catch (Exception ex)
@@ -438,7 +746,7 @@ public partial class MainWindow : Window
             stopwatch.Stop();
             _isCutting = false;
             CutButton.Content = "자르기 실행";
-            SetControlsEnabled(_inputPath is not null);
+            SetControlsEnabled(HasPlayableInput);
             ValidateTrimRange();
         }
     }
@@ -500,7 +808,7 @@ public partial class MainWindow : Window
 
     private void TimelineSlider_PreviewMouseDown(object sender, MouseButtonEventArgs e)
     {
-        if (_inputPath is null)
+        if (!HasPlayableInput)
         {
             return;
         }
@@ -519,7 +827,7 @@ public partial class MainWindow : Window
 
     private void TimelineSlider_PreviewMouseMove(object sender, MouseEventArgs e)
     {
-        if (_inputPath is null || !_isDraggingTimeline || e.LeftButton != MouseButtonState.Pressed)
+        if (!HasPlayableInput || !_isDraggingTimeline || e.LeftButton != MouseButtonState.Pressed)
         {
             return;
         }
@@ -530,7 +838,7 @@ public partial class MainWindow : Window
 
     private void TimelineSlider_PreviewMouseUp(object sender, MouseButtonEventArgs e)
     {
-        if (_inputPath is null)
+        if (!HasPlayableInput)
         {
             return;
         }
@@ -546,7 +854,7 @@ public partial class MainWindow : Window
 
     private void TimelineSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
-        if (_isUpdatingTimeline || !_isDraggingTimeline || _inputPath is null)
+        if (_isUpdatingTimeline || !_isDraggingTimeline || !HasPlayableInput)
         {
             return;
         }
@@ -588,21 +896,109 @@ public partial class MainWindow : Window
         ApplyPrimaryAudioVolumeOnly();
     }
 
-    private void PositionTimer_Tick(object? sender, EventArgs e)
+    private void VolumeSlider_PreviewMouseDown(object sender, MouseButtonEventArgs e)
     {
-        if (_inputPath is null || _isDraggingTimeline)
+        if (!VolumeSlider.IsEnabled)
         {
             return;
         }
 
-        SyncDisplayClockFromVlc(force: false);
+        _isDraggingVolume = true;
+        SetVolumeFromSliderPoint(e.GetPosition(VolumeSlider));
+        VolumeSlider.CaptureMouse();
+        e.Handled = true;
+    }
+
+    private void VolumeSlider_PreviewMouseMove(object sender, MouseEventArgs e)
+    {
+        if (!VolumeSlider.IsEnabled || !_isDraggingVolume || e.LeftButton != MouseButtonState.Pressed)
+        {
+            return;
+        }
+
+        SetVolumeFromSliderPoint(e.GetPosition(VolumeSlider));
+        e.Handled = true;
+    }
+
+    private void VolumeSlider_PreviewMouseUp(object sender, MouseButtonEventArgs e)
+    {
+        if (!_isDraggingVolume)
+        {
+            return;
+        }
+
+        _isDraggingVolume = false;
+        if (VolumeSlider.IsMouseCaptured)
+        {
+            VolumeSlider.ReleaseMouseCapture();
+        }
+
+        SetVolumeFromSliderPoint(e.GetPosition(VolumeSlider));
+        e.Handled = true;
+    }
+
+    private void SetVolumeFromSliderPoint(Point point)
+    {
+        var width = VolumeSlider.ActualWidth;
+        if (width <= 0)
+        {
+            return;
+        }
+
+        var ratio = Math.Clamp(point.X / width, 0, 1);
+        VolumeSlider.Value = VolumeSlider.Minimum + ratio * (VolumeSlider.Maximum - VolumeSlider.Minimum);
+    }
+
+    private void PositionTimer_Tick(object? sender, EventArgs e)
+    {
+        if (!HasPlayableInput || _isDraggingTimeline)
+        {
+            return;
+        }
+
         var current = GetDisplayTime();
+        var handledEndedConcatClip = false;
+        if (CurrentCutMode == CutMode.Concat && !_isPlaybackPaused)
+        {
+            if (_mediaPlayer.State == VLCState.Ended && _currentConcatClipIndex >= 0)
+            {
+                if (_currentConcatClipIndex < _concatClips.Count - 1)
+                {
+                    current = GetConcatClipStart(_currentConcatClipIndex + 1);
+                    LoadConcatClipForTime(current, autoPlay: true);
+                    _isPlaybackPaused = false;
+                    _isPlaybackEnded = false;
+                }
+                else
+                {
+                    current = _duration;
+                }
+
+                ResetDisplayClock(current);
+                handledEndedConcatClip = true;
+            }
+        }
+
+        if (!handledEndedConcatClip)
+        {
+            SyncDisplayClockFromVlc(force: false);
+            current = GetDisplayTime();
+            if (CurrentCutMode == CutMode.Concat
+                && !_isPlaybackPaused
+                && !IsAtPlaybackEnd(current)
+                && TryResolveConcatPosition(current, out var clipIndex, out _)
+                && clipIndex != _currentConcatClipIndex)
+            {
+                LoadConcatClipForTime(current, autoPlay: true);
+            }
+        }
+
         CurrentTimeText.Text = FormatTime(current);
 
         _isUpdatingTimeline = true;
         TimelineSlider.Value = Math.Clamp(current.TotalMilliseconds, TimelineSlider.Minimum, TimelineSlider.Maximum);
         _isUpdatingTimeline = false;
-        if (!_isPlaybackPaused && IsAtPlaybackEnd())
+        if (!_isPlaybackPaused && IsAtPlaybackEnd(current))
         {
             SyncDisplayClockFromVlc(force: true);
             _isPlaybackPaused = true;
@@ -673,15 +1069,43 @@ public partial class MainWindow : Window
 
     private void UpdateCutModeVisibility()
     {
-        if (RangeStartGrid is null || RangeEndGrid is null || SplitPointGrid is null)
+        if (RangeStartGrid is null || RangeEndGrid is null || SplitPointGrid is null || ConcatOptionsGrid is null)
         {
             return;
         }
 
         var splitMode = CurrentCutMode == CutMode.Split;
-        RangeStartGrid.Visibility = splitMode ? Visibility.Collapsed : Visibility.Visible;
-        RangeEndGrid.Visibility = splitMode ? Visibility.Collapsed : Visibility.Visible;
+        var rangeMode = CurrentCutMode == CutMode.Range;
+        var audioExtractMode = CurrentCutMode == CutMode.AudioExtract;
+        var concatMode = CurrentCutMode == CutMode.Concat;
+        RangeStartGrid.Visibility = rangeMode ? Visibility.Visible : Visibility.Collapsed;
+        RangeEndGrid.Visibility = rangeMode ? Visibility.Visible : Visibility.Collapsed;
         SplitPointGrid.Visibility = splitMode ? Visibility.Visible : Visibility.Collapsed;
+        ConcatOptionsGrid.Visibility = Visibility.Visible;
+        VideoListDescriptionText.Text = CurrentCutMode switch
+        {
+            CutMode.Range => "시작·종료 지점을 지정해 설정한 구간을 잘라냅니다.",
+            CutMode.Split => "선택한 지점을 기준으로 앞뒤로 영상을 2개로 분할합니다.",
+            CutMode.AudioExtract => "선택한 영상에서 오디오 트랙 하나를 원본 그대로 추출합니다.",
+            _ => "2개 이상의 영상을 선택한 순서대로 이어 붙입니다."
+        };
+        ConcatMoveButtonsGrid.Visibility = concatMode ? Visibility.Visible : Visibility.Collapsed;
+        SelectListedVideoButton.Visibility = concatMode ? Visibility.Collapsed : Visibility.Visible;
+        ConcatTotalDurationText.Visibility = concatMode ? Visibility.Visible : Visibility.Collapsed;
+        CutButton.Content = CurrentCutMode switch
+        {
+            CutMode.Concat => "이어 붙이기 실행",
+            CutMode.AudioExtract => "오디오 추출",
+            _ => "자르기 실행"
+        };
+        AudioTrackHost.Visibility = Visibility.Visible;
+        MixAudioTracksCheckBox.Visibility = audioExtractMode ? Visibility.Collapsed : Visibility.Visible;
+
+        _duration = concatMode ? GetConcatTotalDuration() : _singleInputDuration;
+        DurationText.Text = FormatTime(_duration);
+        TimelineSlider.Maximum = Math.Max(1, _duration.TotalMilliseconds);
+        UpdateTimelineMarkers();
+        UpdateConcatClipButtonStates();
         ValidateTrimRange();
     }
 
@@ -693,14 +1117,12 @@ public partial class MainWindow : Window
 
     private static string BuildCutNotice()
     {
-        return
-            "시작지점과 종료지점이 컨테이너 경계로 인한 오차가 있을 수 있습니다.\n" +
-            "계속 진행하시겠습니까?";
+        return "시작지점과 종료지점이 컨테이너 경계로 인한 오차가 있을 수 있습니다. 계속 진행하시겠습니까?";
     }
 
     private async Task<TimeSpan> ProbeDurationAsync(string inputPath)
     {
-        var result = await RunProcessAsync(ResolveToolPath("ffprobe.exe"), new[]
+        var result = await FfmpegService.RunProcessAsync(FfmpegService.ResolveToolPath("ffprobe.exe"), new[]
         {
             "-v",
             "error",
@@ -725,21 +1147,56 @@ public partial class MainWindow : Window
         return TimeSpan.FromSeconds(seconds);
     }
 
+    private async Task<string[]> ProbeAudioCodecNamesAsync(string inputPath)
+    {
+        var result = await FfmpegService.RunProcessAsync(FfmpegService.ResolveToolPath("ffprobe.exe"), new[]
+        {
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "csv=p=0",
+            inputPath
+        });
+
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(result.Error.Length > 0 ? result.Error : result.Output);
+        }
+
+        return result.Output
+            .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Trim())
+            .Where(line => line.Length > 0)
+            .ToArray();
+    }
+
     private void ValidateTrimRange()
     {
+        var hasModeInput = CurrentCutMode == CutMode.Concat
+            ? _concatClips.Count >= 2
+            : _inputPath is not null;
         var canCut = _controlsEnabled
             && !_isCutting
-            && _inputPath is not null
-            && _outputPath is not null;
+            && hasModeInput
+            && !string.IsNullOrWhiteSpace(_outputPath);
 
         if (canCut)
         {
-            canCut = CurrentCutMode == CutMode.Split
-                ? TryReadSplitPoint(out _)
-                : TryReadTrimRange(out var start, out var end)
+            canCut = CurrentCutMode switch
+            {
+                CutMode.Split => TryReadSplitPoint(out _),
+                CutMode.Concat => _concatClips.Count >= 2,
+                CutMode.AudioExtract => _selectedAudioTrackDisplayIndex.HasValue
+                    && _audioTrackOptions.Any(audio => audio.DisplayIndex == _selectedAudioTrackDisplayIndex.Value),
+                _ => TryReadTrimRange(out var start, out var end)
                     && end > start
                     && start >= TimeSpan.Zero
-                    && (_duration == TimeSpan.Zero || end <= _duration);
+                    && (_duration == TimeSpan.Zero || end <= _duration)
+            };
         }
 
         CutButton.IsEnabled = canCut;
@@ -779,7 +1236,7 @@ public partial class MainWindow : Window
 
         OpenButton.IsEnabled = !_isCutting;
         CutModeTabs.IsEnabled = !_isCutting;
-        PlayPauseButton.IsEnabled = enabled || (_isCutting && _inputPath is not null);
+        PlayPauseButton.IsEnabled = enabled || (_isCutting && HasPlayableInput);
         SetStartButton.IsEnabled = enabled;
         SetEndButton.IsEnabled = enabled;
         SetSplitButton.IsEnabled = enabled;
@@ -790,593 +1247,118 @@ public partial class MainWindow : Window
         SeekStepComboBox.IsEnabled = enabled;
         VolumeSlider.IsEnabled = enabled;
         TimelineSlider.IsEnabled = enabled;
+        UpdateAudioMixOptionState();
+        UpdateConcatClipButtonStates();
         ValidateTrimRange();
     }
 
-    private async Task StartAdditionalAudioTracksAsync()
+    private void MixAudioTracksCheckBox_Changed(object sender, RoutedEventArgs e)
     {
-        ClearAudioTrackOptions();
+        _mixAudioTracksToSingleTrack = MixAudioTracksCheckBox.IsChecked == true;
+    }
+
+    private void UpdateAudioMixOptionState()
+    {
+        if (MixAudioTracksCheckBox is null)
+        {
+            return;
+        }
+
+        MixAudioTracksCheckBox.IsEnabled = CurrentCutMode != CutMode.AudioExtract
+            && !_isCutting
+            && _audioTrackOptions.Count(audio => !audio.ExcludeFromOutput) > 1;
+    }
+
+    private bool ShouldMixAudioTracks()
+    {
+        return _mixAudioTracksToSingleTrack
+            && _audioTrackOptions.Count(audio => !audio.ExcludeFromOutput) > 1;
+    }
+
+    private AudioTrackOption? GetSelectedAudioTrackOption()
+    {
+        return _audioTrackOptions
+            .FirstOrDefault(audio => audio.DisplayIndex == _selectedAudioTrackDisplayIndex);
+    }
+
+    private async Task ExtractAudioButton_ClickAsync()
+    {
         if (_inputPath is null)
         {
+            MessageBox.Show(this, "오디오를 추출할 영상을 선택하세요.", "오디오 추출", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
-        var tracks = Array.Empty<LibVLCSharp.Shared.Structures.TrackDescription>();
-        for (var attempt = 0; attempt < 8; attempt++)
-        {
-            tracks = _mediaPlayer.AudioTrackDescription?
-                .Where(track => track.Id >= 0)
-                .ToArray() ?? Array.Empty<LibVLCSharp.Shared.Structures.TrackDescription>();
-
-            if (tracks.Length > 0)
-            {
-                break;
-            }
-
-            await Task.Delay(250);
-        }
-
-        if (tracks.Length == 0)
-        {
-            ApplyPrimaryAudioVolumeOnly();
-            AudioTrackHost.Visibility = Visibility.Collapsed;
-            return;
-        }
-
-        for (var index = 0; index < tracks.Length; index++)
-        {
-            var track = tracks[index];
-            var displayName = string.IsNullOrWhiteSpace(track.Name) ? $"Track {index + 1}" : track.Name;
-            _audioTrackOptions.Add(new AudioTrackOption(track.Id, index + 1, displayName));
-        }
-
-        _selectedAudioTrackDisplayIndex = _audioTrackOptions.FirstOrDefault()?.DisplayIndex;
-        ApplySelectedAudioTrack();
-        PopulateAudioTrackControls();
-    }
-
-    private static async Task InitializeAdditionalAudioPlayerAsync(AdditionalAudioPlayer audio, TimeSpan currentTime)
-    {
-        var tracks = Array.Empty<LibVLCSharp.Shared.Structures.TrackDescription>();
-        for (var attempt = 0; attempt < 20; attempt++)
-        {
-            tracks = audio.Player.AudioTrackDescription?
-                .Where(track => track.Id >= 0)
-                .ToArray() ?? Array.Empty<LibVLCSharp.Shared.Structures.TrackDescription>();
-
-            if (tracks.Length > 0)
-            {
-                break;
-            }
-
-            await Task.Delay(100);
-        }
-
-        audio.SelectedTrackId = ResolveTrackId(audio, tracks);
-        audio.TrackSelectionSucceeded = audio.Player.SetAudioTrack(audio.SelectedTrackId);
-        audio.Player.Time = (long)Math.Round(currentTime.TotalMilliseconds);
-    }
-
-    private static int ResolveTrackId(
-        AdditionalAudioPlayer audio,
-        LibVLCSharp.Shared.Structures.TrackDescription[] tracks)
-    {
-        if (tracks.Any(track => track.Id == audio.TrackId))
-        {
-            return audio.TrackId;
-        }
-
-        var index = audio.DisplayIndex - 1;
-        if (index >= 0 && index < tracks.Length)
-        {
-            return tracks[index].Id;
-        }
-
-        return audio.TrackId;
-    }
-
-    private void PlayAdditionalAudioPlayers()
-    {
-        _isPlaybackPaused = false;
-        ApplyAudioPlaybackStateOrdered(syncTime: true);
-    }
-
-    private void PauseAdditionalAudioPlayers()
-    {
-        _audioPlaybackStateVersion++;
-        _isPlaybackPaused = true;
-        foreach (var audio in _additionalAudioPlayers)
-        {
-            audio.Player.SetPause(true);
-        }
-    }
-
-    private void ApplyAdditionalAudioVolume()
-    {
-        ApplyAdditionalAudioVolumeOnly();
-    }
-
-    private void ApplyPrimaryAudioVolumeOnly()
-    {
-        _mediaPlayer.Mute = _masterVolume <= 0;
-        _mediaPlayer.Volume = _masterVolume;
-    }
-
-    private void ApplyAdditionalAudioVolumeOnly()
-    {
-        foreach (var audio in _additionalAudioPlayers)
-        {
-            var isSelected = _selectedAudioTrackDisplayIndex == audio.DisplayIndex;
-            if (isSelected)
-            {
-                audio.Player.Mute = _masterVolume <= 0;
-                audio.Player.Volume = _masterVolume;
-            }
-            else
-            {
-                audio.Player.Volume = 0;
-            }
-        }
-    }
-
-    private void ApplyPrimaryAudioSettings()
-    {
-        if (_additionalAudioPlayers.Count == 0)
-        {
-            ApplyPrimaryAudioVolumeOnly();
-            return;
-        }
-
-        _mediaPlayer.SetAudioTrack(-1);
-        _mediaPlayer.Mute = true;
-        _mediaPlayer.Volume = 0;
-    }
-
-    private void ApplyAudioPlaybackState(bool syncTime)
-    {
-        if (_additionalAudioPlayers.Count == 0)
-        {
-            ApplyPrimaryAudioVolumeOnly();
-            _mediaPlayer.SetPause(_isPlaybackPaused);
-            return;
-        }
-
-        _mediaPlayer.Mute = true;
-        _mediaPlayer.Volume = 0;
-
-        var currentMilliseconds = (long)Math.Round(GetCurrentTime().TotalMilliseconds);
-        foreach (var audio in _additionalAudioPlayers)
-        {
-            audio.Player.Volume = 0;
-            audio.Player.SetPause(true);
-            audio.Player.Mute = false;
-
-            if (syncTime)
-            {
-                audio.Player.Time = currentMilliseconds;
-            }
-        }
-
-        var selectedAudio = _additionalAudioPlayers
-            .FirstOrDefault(audio => audio.DisplayIndex == _selectedAudioTrackDisplayIndex);
+        var selectedAudio = GetSelectedAudioTrackOption();
         if (selectedAudio is null)
         {
-            StatusText.Text = "선택된 오디오 트랙을 찾을 수 없습니다.";
+            MessageBox.Show(this, "추출할 오디오 트랙을 선택하세요.", "오디오 추출", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
-        selectedAudio.Player.SetAudioTrack(selectedAudio.SelectedTrackId);
-        if (syncTime)
+        if (string.IsNullOrWhiteSpace(_outputPath))
         {
-            selectedAudio.Player.Time = currentMilliseconds;
+            RefreshDefaultOutputPathForCurrentMode();
         }
 
-        selectedAudio.Player.Mute = _masterVolume <= 0;
-        selectedAudio.Player.Volume = _masterVolume;
-
-        if (!_isPlaybackPaused)
+        if (Path.GetFullPath(_inputPath).Equals(Path.GetFullPath(_outputPath!), StringComparison.OrdinalIgnoreCase))
         {
-            selectedAudio.Player.Play();
-            if (syncTime)
+            MessageBox.Show(this, "입력 파일과 출력 파일이 같을 수 없습니다.", "저장 위치 확인", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        SetOutputPath(OutputPathService.GetAvailableOutputPath(_outputPath!));
+        var codecText = string.IsNullOrWhiteSpace(selectedAudio.CodecName)
+            ? ""
+            : $" ({selectedAudio.CodecName})";
+        var extractAnswer = MessageBox.Show(
+            this,
+            $"선택한 영상: {Path.GetFileName(_inputPath)}\n" +
+            $"선택한 오디오 트랙: {selectedAudio.DisplayIndex}번 - {selectedAudio.Name}{codecText}\n" +
+            "추출하시겠습니까?",
+            "오디오 추출 확인",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+        if (extractAnswer != MessageBoxResult.Yes)
+        {
+            StatusText.Text = "오디오 추출을 취소했습니다.";
+            ValidateTrimRange();
+            return;
+        }
+
+        _isCutting = true;
+        SetControlsEnabled(false);
+        CutButton.Content = "추출 중...";
+        StatusText.Text = $"오디오 트랙 {selectedAudio.DisplayIndex} 추출 중입니다.";
+        var stopwatch = Stopwatch.StartNew();
+        UpdateCutProgress(0, stopwatch.Elapsed, null, "오디오 추출");
+
+        try
+        {
+            var args = FfmpegService.BuildAudioExtractArguments(_inputPath, selectedAudio.DisplayIndex, _outputPath!);
+            var result = await FfmpegService.RunFfmpegAsync(FfmpegService.ResolveToolPath("ffmpeg.exe"), args, _duration, stopwatch, "오디오 추출", ReportCutProgress);
+            if (result.ExitCode != 0)
             {
-                selectedAudio.Player.Time = currentMilliseconds;
+                throw new InvalidOperationException(result.Error.Length > 0 ? result.Error : result.Output);
             }
 
-            selectedAudio.Player.SetPause(false);
+            UpdateCutProgress(100, stopwatch.Elapsed, TimeSpan.Zero);
+            StatusText.Text = $"완료: {Path.GetFileName(_outputPath)}";
+            MessageBox.Show(this, "오디오 추출 완료", "완료", MessageBoxButton.OK, MessageBoxImage.Information);
+            SetOutputPath(OutputPathService.GetAvailableOutputPath(_outputPath!));
         }
-        else
+        catch (Exception ex)
         {
-            selectedAudio.Player.SetPause(true);
+            StatusText.Text = $"오디오 추출 실패: {Shorten(ex.Message)}";
+            MessageBox.Show(this, ex.Message, "오디오 추출 실패", MessageBoxButton.OK, MessageBoxImage.Error);
         }
-    }
-
-    private void ApplyAudioPlaybackStateOrdered(bool syncTime)
-    {
-        var version = ++_audioPlaybackStateVersion;
-        _ = ApplyAudioPlaybackStateOrderedAsync(syncTime, version);
-    }
-
-    private async Task ApplyAudioPlaybackStateOrderedAsync(bool syncTime, int version)
-    {
-        if (_additionalAudioPlayers.Count == 0)
+        finally
         {
-            ApplyPrimaryAudioVolumeOnly();
-            _mediaPlayer.SetPause(_isPlaybackPaused);
-            return;
+            _isCutting = false;
+            CutButton.Content = "오디오 추출";
+            SetControlsEnabled(HasPlayableInput);
+            ValidateTrimRange();
         }
-
-        _mediaPlayer.Mute = true;
-        _mediaPlayer.Volume = 0;
-
-        var currentMilliseconds = (long)Math.Round(GetCurrentTime().TotalMilliseconds);
-        var selectedAudio = _additionalAudioPlayers
-            .FirstOrDefault(audio => audio.DisplayIndex == _selectedAudioTrackDisplayIndex);
-        if (selectedAudio is null)
-        {
-            StatusText.Text = "선택된 오디오 트랙을 찾을 수 없습니다.";
-            return;
-        }
-
-        foreach (var audio in _additionalAudioPlayers)
-        {
-            if (audio == selectedAudio)
-            {
-                continue;
-            }
-
-            audio.Player.Volume = 0;
-            audio.Player.SetPause(true);
-            audio.Player.Mute = false;
-
-            if (syncTime)
-            {
-                audio.Player.Time = currentMilliseconds;
-            }
-        }
-
-        if (version != _audioPlaybackStateVersion)
-        {
-            return;
-        }
-
-        selectedAudio.Player.SetAudioTrack(selectedAudio.SelectedTrackId);
-        if (syncTime)
-        {
-            selectedAudio.Player.Time = currentMilliseconds;
-        }
-
-        selectedAudio.Player.Mute = _masterVolume <= 0;
-        selectedAudio.Player.Volume = _masterVolume;
-
-        if (_isPlaybackPaused)
-        {
-            selectedAudio.Player.SetPause(true);
-            return;
-        }
-
-        selectedAudio.Player.Play();
-        if (syncTime)
-        {
-            selectedAudio.Player.Time = currentMilliseconds;
-        }
-
-        await Dispatcher.Yield(DispatcherPriority.Background);
-        if (version != _audioPlaybackStateVersion)
-        {
-            return;
-        }
-
-        var latestMilliseconds = (long)Math.Round(GetCurrentTime().TotalMilliseconds);
-        selectedAudio.Player.SetAudioTrack(selectedAudio.SelectedTrackId);
-        if (syncTime)
-        {
-            selectedAudio.Player.Time = latestMilliseconds;
-        }
-
-        selectedAudio.Player.Mute = _masterVolume <= 0;
-        selectedAudio.Player.Volume = _masterVolume;
-        selectedAudio.Player.SetPause(false);
-    }
-
-    private void PopulateAudioTrackControls()
-    {
-        AudioTracksPanel.Children.Clear();
-        AudioTrackHost.Visibility = _audioTrackOptions.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
-
-        foreach (var audio in _audioTrackOptions)
-        {
-            AudioTracksPanel.Children.Add(CreateAudioTrackOptionControl(audio));
-        }
-
-        UpdateAudioTrackButtonStates();
-    }
-
-    private UIElement CreateAudioTrackOptionControl(AudioTrackOption audio)
-    {
-        var box = new Border
-        {
-            Margin = new Thickness(0, 0, 10, 0),
-            Padding = new Thickness(8),
-            BorderBrush = System.Windows.Media.Brushes.LightGray,
-            BorderThickness = new Thickness(1),
-            Background = System.Windows.Media.Brushes.White
-        };
-
-        var panel = new StackPanel
-        {
-            Orientation = Orientation.Vertical
-        };
-        box.Child = panel;
-
-        var titlePanel = new StackPanel
-        {
-            Orientation = Orientation.Horizontal
-        };
-        titlePanel.Children.Add(CreateAudioTrackButton(audio.DisplayIndex.ToString(CultureInfo.InvariantCulture), audio, audio.Name));
-        titlePanel.Children.Add(new TextBlock
-        {
-            Text = audio.Name,
-            Margin = new Thickness(8, 0, 0, 0),
-            MaxWidth = 180,
-            VerticalAlignment = VerticalAlignment.Center,
-            TextTrimming = TextTrimming.CharacterEllipsis,
-            ToolTip = audio.Name
-        });
-        panel.Children.Add(titlePanel);
-
-        var optionsPanel = new StackPanel
-        {
-            Orientation = Orientation.Horizontal,
-            Margin = new Thickness(0, 8, 0, 0)
-        };
-
-        var deleteCheckBox = new CheckBox
-        {
-            Content = "제거",
-            Tag = audio,
-            IsChecked = audio.ExcludeFromOutput,
-            VerticalAlignment = VerticalAlignment.Center,
-            ToolTip = "자르기 결과에서 이 오디오 트랙 제거"
-        };
-        deleteCheckBox.Checked += OutputAudioTrackCheckBox_Changed;
-        deleteCheckBox.Unchecked += OutputAudioTrackCheckBox_Changed;
-        optionsPanel.Children.Add(deleteCheckBox);
-
-        var muteCheckBox = new CheckBox
-        {
-            Content = "음소거",
-            Tag = audio,
-            IsChecked = audio.MuteInOutput,
-            Margin = new Thickness(12, 0, 0, 0),
-            VerticalAlignment = VerticalAlignment.Center,
-            ToolTip = "트랙은 유지하고 출력 오디오만 0으로 만들기"
-        };
-        muteCheckBox.Checked += OutputAudioTrackMuteCheckBox_Changed;
-        muteCheckBox.Unchecked += OutputAudioTrackMuteCheckBox_Changed;
-        optionsPanel.Children.Add(muteCheckBox);
-
-        panel.Children.Add(optionsPanel);
-
-        return box;
-    }
-
-    private Button CreateAudioTrackButton(string text, object tag, string? toolTip)
-    {
-        var button = new Button
-        {
-            Content = text,
-            Tag = tag,
-            ToolTip = toolTip,
-            MinWidth = 48,
-            Height = 32,
-            Padding = new Thickness(12, 0, 12, 0)
-        };
-        button.Click += AudioTrackButton_Click;
-        return button;
-    }
-
-    private void OutputAudioTrackCheckBox_Changed(object sender, RoutedEventArgs e)
-    {
-        if (sender is CheckBox checkBox && checkBox.Tag is AudioTrackOption audio)
-        {
-            audio.ExcludeFromOutput = checkBox.IsChecked == true;
-            if (audio.ExcludeFromOutput && audio.MuteInOutput)
-            {
-                audio.MuteInOutput = false;
-                PopulateAudioTrackControls();
-            }
-        }
-    }
-
-    private void OutputAudioTrackMuteCheckBox_Changed(object sender, RoutedEventArgs e)
-    {
-        if (sender is CheckBox checkBox && checkBox.Tag is AudioTrackOption audio)
-        {
-            audio.MuteInOutput = checkBox.IsChecked == true;
-            if (audio.MuteInOutput && audio.ExcludeFromOutput)
-            {
-                audio.ExcludeFromOutput = false;
-                PopulateAudioTrackControls();
-            }
-        }
-    }
-
-    private void AudioTrackButton_Click(object sender, RoutedEventArgs e)
-    {
-        if (sender is not Button button)
-        {
-            return;
-        }
-
-        if (button.Tag is not AudioTrackOption audio)
-        {
-            return;
-        }
-
-        _selectedAudioTrackDisplayIndex = audio.DisplayIndex;
-        ApplySelectedAudioTrack();
-        ReportSelectedAudioTrack();
-    }
-
-    private void ApplySelectedAudioTrack()
-    {
-        var selectedAudio = _audioTrackOptions
-            .FirstOrDefault(audio => audio.DisplayIndex == _selectedAudioTrackDisplayIndex);
-        if (selectedAudio is null)
-        {
-            StatusText.Text = "선택된 오디오 트랙을 찾을 수 없습니다.";
-            return;
-        }
-
-        _mediaPlayer.SetAudioTrack(selectedAudio.TrackId);
-        ApplyPrimaryAudioVolumeOnly();
-        UpdateAudioTrackButtonStates();
-    }
-
-    private void UpdateAudioTrackButtonStates()
-    {
-        foreach (var button in AudioTracksPanel.Children
-            .OfType<Border>()
-            .SelectMany(GetAudioTrackButtons))
-        {
-            var isSelected = button.Tag is AudioTrackOption audio
-                && _selectedAudioTrackDisplayIndex == audio.DisplayIndex;
-            button.FontWeight = isSelected ? FontWeights.SemiBold : FontWeights.Normal;
-            button.Background = isSelected ? SystemColors.HighlightBrush : SystemColors.ControlBrush;
-            button.Foreground = isSelected ? SystemColors.HighlightTextBrush : SystemColors.ControlTextBrush;
-        }
-    }
-
-    private static IEnumerable<Button> GetAudioTrackButtons(UIElement element)
-    {
-        if (element is Button button)
-        {
-            yield return button;
-        }
-
-        if (element is Border { Child: UIElement borderChild })
-        {
-            foreach (var childButton in GetAudioTrackButtons(borderChild))
-            {
-                yield return childButton;
-            }
-        }
-
-        if (element is Panel panel)
-        {
-            foreach (UIElement panelChild in panel.Children)
-            {
-                foreach (var childButton in GetAudioTrackButtons(panelChild))
-                {
-                    yield return childButton;
-                }
-            }
-        }
-    }
-
-    private void ReportSelectedAudioTrack()
-    {
-        StatusText.Text = $"오디오 트랙 {_selectedAudioTrackDisplayIndex} 재생";
-    }
-
-    private UIElement CreateAudioTrackControl(AdditionalAudioPlayer audio)
-    {
-        var card = new Border
-        {
-            Width = 250,
-            Margin = new Thickness(0, 0, 10, 0),
-            Padding = new Thickness(10),
-            BorderBrush = System.Windows.Media.Brushes.LightGray,
-            BorderThickness = new Thickness(1),
-            Background = System.Windows.Media.Brushes.White
-        };
-
-        var panel = new StackPanel();
-        card.Child = panel;
-
-        panel.Children.Add(new TextBlock
-        {
-            Text = $"트랙 {audio.DisplayIndex}: {audio.Name}",
-            FontWeight = FontWeights.SemiBold,
-            TextTrimming = TextTrimming.CharacterEllipsis,
-            ToolTip = audio.Name
-        });
-
-        var enabledCheckBox = new CheckBox
-        {
-            Content = "음소거",
-            IsChecked = !audio.IsEnabled,
-            Tag = audio,
-            Margin = new Thickness(0, 8, 0, 0)
-        };
-        enabledCheckBox.Checked += TrackEnabledCheckBox_Changed;
-        enabledCheckBox.Unchecked += TrackEnabledCheckBox_Changed;
-        panel.Children.Add(enabledCheckBox);
-
-        return card;
-    }
-
-    private void TrackEnabledCheckBox_Changed(object sender, RoutedEventArgs e)
-    {
-        if (sender is CheckBox checkBox && checkBox.Tag is AdditionalAudioPlayer audio)
-        {
-            audio.IsEnabled = checkBox.IsChecked != true;
-            audio.Player.SetAudioTrack(audio.SelectedTrackId);
-            audio.Player.Time = (long)Math.Round(GetCurrentTime().TotalMilliseconds);
-            ApplyAudioPlaybackStateOrdered(syncTime: true);
-            audio.Player.SetPause(_isPlaybackPaused);
-            ReportAudioTrackState(audio);
-        }
-    }
-
-    private void ReportAudioTrackState(AdditionalAudioPlayer audio)
-    {
-        StatusText.Text =
-            $"트랙 {audio.DisplayIndex} {(audio.IsEnabled ? "재생" : "음소거")} | " +
-            $"선택 트랙 ID {audio.Player.AudioTrack} / 요청 {audio.TrackId}";
-    }
-
-    private void SynchronizeAdditionalAudioPlayers(TimeSpan target, bool force)
-    {
-        if (_isPlaybackPaused && !force)
-        {
-            return;
-        }
-
-        var targetMilliseconds = (long)Math.Round(target.TotalMilliseconds);
-        foreach (var audio in _additionalAudioPlayers)
-        {
-            var drift = Math.Abs(audio.Player.Time - targetMilliseconds);
-            if (force || drift > 350)
-            {
-                audio.Player.Time = targetMilliseconds;
-            }
-        }
-    }
-
-    private void DisposeAdditionalAudioPlayers()
-    {
-        _audioPlaybackStateVersion++;
-        foreach (var audio in _additionalAudioPlayers)
-        {
-            audio.Player.Stop();
-            audio.Player.Dispose();
-            audio.Media.Dispose();
-            audio.LibVlc.Dispose();
-        }
-
-        _additionalAudioPlayers.Clear();
-        _selectedAudioTrackDisplayIndex = null;
-        AudioTracksPanel.Children.Clear();
-        AudioTrackHost.Visibility = Visibility.Collapsed;
-    }
-
-    private void ClearAudioTrackOptions()
-    {
-        _audioTrackOptions.Clear();
-        _selectedAudioTrackDisplayIndex = null;
-        AudioTracksPanel.Children.Clear();
-        AudioTrackHost.Visibility = Visibility.Collapsed;
     }
 
     private TimeSpan GetCurrentTime()
@@ -1403,6 +1385,33 @@ public partial class MainWindow : Window
 
     private void SyncDisplayClockFromVlc(bool force)
     {
+        if (CurrentCutMode == CutMode.Concat)
+        {
+            if (_currentConcatClipIndex < 0 || _currentConcatClipIndex >= _concatClips.Count)
+            {
+                return;
+            }
+
+            var concatNow = _playbackClock.Elapsed;
+            if (!force && concatNow - _lastVlcSyncClock < TimeSpan.FromMilliseconds(250))
+            {
+                return;
+            }
+
+            var clipStart = GetConcatClipStart(_currentConcatClipIndex);
+            var concatVlcTime = TimeSpan.FromMilliseconds(Math.Max(0, _mediaPlayer.Time));
+            var concatDisplayTime = ClampTime(clipStart + concatVlcTime);
+            var currentDisplayTime = GetDisplayTime();
+            if (force || Math.Abs((concatDisplayTime - currentDisplayTime).TotalMilliseconds) > 250)
+            {
+                _displayTimeBase = concatDisplayTime;
+                _displayClockBase = concatNow;
+            }
+
+            _lastVlcSyncClock = concatNow;
+            return;
+        }
+
         if (_inputPath is null)
         {
             return;
@@ -1433,7 +1442,14 @@ public partial class MainWindow : Window
     private bool IsAtPlaybackEnd(TimeSpan time)
     {
         return _duration > TimeSpan.Zero
-            && _duration - time <= TimeSpan.FromMilliseconds(300);
+            && _duration - time <= GetPlaybackEndTolerance();
+    }
+
+    private TimeSpan GetPlaybackEndTolerance()
+    {
+        return CurrentCutMode == CutMode.Concat
+            ? TimeSpan.FromMilliseconds(80)
+            : TimeSpan.FromMilliseconds(300);
     }
 
     private TimeSpan GetSeekStep()
@@ -1467,6 +1483,13 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (CurrentCutMode == CutMode.Concat)
+        {
+            LoadConcatClipForTime(target, autoPlay: !_isPlaybackPaused);
+            SetConcatTimelinePosition(target);
+            return;
+        }
+
         var milliseconds = (long)Math.Round(target.TotalMilliseconds);
 
         _mediaPlayer.Time = milliseconds;
@@ -1480,6 +1503,27 @@ public partial class MainWindow : Window
 
     private void RestartPlaybackFrom(TimeSpan target)
     {
+        if (CurrentCutMode == CutMode.Concat)
+        {
+            if (_concatClips.Count == 0)
+            {
+                return;
+            }
+
+            target = ClampTime(target);
+            LoadConcatClipForTime(target, autoPlay: true);
+            ResetDisplayClock(target);
+            _isPlaybackEnded = false;
+            _isPlaybackPaused = false;
+            PlayPauseButton.Content = "일시정지";
+            CurrentTimeText.Text = FormatTime(target);
+
+            _isUpdatingTimeline = true;
+            TimelineSlider.Value = Math.Clamp(target.TotalMilliseconds, TimelineSlider.Minimum, TimelineSlider.Maximum);
+            _isUpdatingTimeline = false;
+            return;
+        }
+
         if (_inputPath is null)
         {
             return;
@@ -1520,6 +1564,16 @@ public partial class MainWindow : Window
         }
 
         return time;
+    }
+
+    private static TimeSpan ClampToDuration(TimeSpan time, TimeSpan duration)
+    {
+        if (time < TimeSpan.Zero || duration <= TimeSpan.Zero)
+        {
+            return TimeSpan.Zero;
+        }
+
+        return time > duration ? duration : time;
     }
 
     private void ResetCutProgress()
@@ -1568,8 +1622,8 @@ public partial class MainWindow : Window
 
             return new[]
             {
-                new CutJob(TimeSpan.Zero, splitPoint, GetAvailableOutputPath(BuildPartOutputPath(outputPath, 1))),
-                new CutJob(splitPoint, _duration - splitPoint, GetAvailableOutputPath(BuildPartOutputPath(outputPath, 2)))
+                new CutJob(TimeSpan.Zero, splitPoint, OutputPathService.GetAvailableOutputPath(OutputPathService.BuildPartOutputPath(outputPath, 1))),
+                new CutJob(splitPoint, _duration - splitPoint, OutputPathService.GetAvailableOutputPath(OutputPathService.BuildPartOutputPath(outputPath, 2)))
             };
         }
 
@@ -1580,281 +1634,135 @@ public partial class MainWindow : Window
 
         return new[]
         {
-            new CutJob(start, end - start, GetAvailableOutputPath(outputPath))
+            new CutJob(start, end - start, OutputPathService.GetAvailableOutputPath(outputPath))
         };
     }
 
-    private static List<string> BuildFfmpegCutArguments(
-        string inputPath,
-        TimeSpan start,
-        TimeSpan trimDuration,
-        string outputPath,
-        IEnumerable<AudioTrackOption> audioTracks)
+    private async Task EnsureConcatStreamCompatibilityAsync()
     {
-        var audioTrackOptions = audioTracks.ToArray();
-        var excludedAudioTracks = audioTrackOptions
-            .Where(track => track.ExcludeFromOutput)
-            .ToArray();
-        var mutedAudioTracks = audioTrackOptions
-            .Where(track => track.MuteInOutput && !track.ExcludeFromOutput)
-            .ToArray();
-        var args = new List<string>
+        if (_concatClips.Count < 2)
         {
-            "-hide_banner",
-            "-nostdin",
-            "-progress",
-            "pipe:1",
-            "-nostats",
-            "-y",
-            "-ss",
-            ToFfmpegTime(start),
-            "-i",
-            inputPath,
-            "-t",
-            ToFfmpegTime(trimDuration)
-        };
-
-        if (mutedAudioTracks.Length > 0)
-        {
-            args.Add("-filter_complex");
-            args.Add(string.Join(";", mutedAudioTracks.Select(track =>
-                $"[0:a:{track.DisplayIndex - 1}]volume=0[{GetMutedAudioLabel(track)}]")));
+            return;
         }
 
-        args.AddRange(new[]
+        var firstSignature = await ProbeConcatStreamSignatureAsync(_concatClips[0].Path);
+        for (var index = 1; index < _concatClips.Count; index++)
         {
-            "-map",
-            "0"
-        });
-
-        foreach (var audioTrack in excludedAudioTracks)
-        {
-            args.Add("-map");
-            args.Add($"-0:a:{audioTrack.DisplayIndex - 1}");
-        }
-
-        foreach (var audioTrack in mutedAudioTracks)
-        {
-            args.Add("-map");
-            args.Add($"-0:a:{audioTrack.DisplayIndex - 1}");
-        }
-
-        foreach (var audioTrack in mutedAudioTracks)
-        {
-            args.Add("-map");
-            args.Add($"[{GetMutedAudioLabel(audioTrack)}]");
-        }
-
-        args.AddRange(new[]
-        {
-            "-c",
-            "copy"
-        });
-
-        var copiedAudioTrackCount = audioTrackOptions
-            .Count(track => !track.ExcludeFromOutput && !track.MuteInOutput);
-        for (var index = 0; index < mutedAudioTracks.Length; index++)
-        {
-            args.Add($"-c:a:{copiedAudioTrackCount + index}");
-            args.Add("aac");
-        }
-
-        args.AddRange(new[]
-        {
-            "-avoid_negative_ts",
-            "make_zero",
-            outputPath
-        });
-
-        return args;
-    }
-
-    private static string GetMutedAudioLabel(AudioTrackOption audioTrack)
-    {
-        return $"muted_audio_{audioTrack.DisplayIndex}";
-    }
-
-    private async Task<ProcessResult> RunFfmpegCutAsync(
-        string fileName,
-        IEnumerable<string> arguments,
-        TimeSpan totalDuration,
-        Stopwatch stopwatch,
-        string? progressTitle)
-    {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = fileName,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true
-        };
-
-        foreach (var argument in arguments)
-        {
-            startInfo.ArgumentList.Add(argument);
-        }
-
-        using var process = Process.Start(startInfo)
-            ?? throw new InvalidOperationException($"{fileName} 실행에 실패했습니다.");
-
-        var errorTask = process.StandardError.ReadToEndAsync();
-        var progressTask = ReadProgressAsync(process, totalDuration, stopwatch, progressTitle);
-
-        await process.WaitForExitAsync();
-        await progressTask;
-        var error = await errorTask;
-
-        return new ProcessResult(process.ExitCode, "", error.Trim());
-    }
-
-    private async Task ReadProgressAsync(Process process, TimeSpan totalDuration, Stopwatch stopwatch, string? progressTitle)
-    {
-        while (await process.StandardOutput.ReadLineAsync() is { } line)
-        {
-            if (TryParseProgressSeconds(line, out var seconds))
+            var signature = await ProbeConcatStreamSignatureAsync(_concatClips[index].Path);
+            if (!string.Equals(firstSignature, signature, StringComparison.Ordinal))
             {
-                ReportCutProgress(seconds, totalDuration, stopwatch, progressTitle);
-            }
-            else if (line.Equals("progress=end", StringComparison.OrdinalIgnoreCase))
-            {
-                ReportCutProgress(totalDuration.TotalSeconds, totalDuration, stopwatch, progressTitle);
+                throw new InvalidOperationException(
+                    "선택한 영상들의 스트림 구조가 달라서 무손실 이어붙이기를 할 수 없습니다.\n" +
+                    "비디오/오디오 코덱, 해상도, 오디오 트랙 수가 같은 파일끼리만 지원합니다.");
             }
         }
     }
 
-    private static bool TryParseProgressSeconds(string line, out double seconds)
+    private async Task<string> ProbeConcatStreamSignatureAsync(string inputPath)
     {
-        seconds = 0;
-        var equalsIndex = line.IndexOf('=');
-        if (equalsIndex <= 0 || equalsIndex == line.Length - 1)
+        var result = await FfmpegService.RunProcessAsync(FfmpegService.ResolveToolPath("ffprobe.exe"), new[]
         {
-            return false;
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=index,codec_type,codec_name,profile,level,codec_tag_string,width,height,pix_fmt,sample_fmt,sample_rate,channels,channel_layout,time_base,avg_frame_rate,r_frame_rate,color_range,color_space,color_transfer,color_primaries,field_order,bits_per_raw_sample",
+            "-of",
+            "compact=p=0:nk=0",
+            inputPath
+        });
+
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException(result.Error.Length > 0 ? result.Error : result.Output);
         }
 
-        var key = line[..equalsIndex];
-        var value = line[(equalsIndex + 1)..];
-
-        if (key is "out_time_ms" or "out_time_us"
-            && long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var microseconds))
-        {
-            seconds = microseconds / 1_000_000d;
-            return true;
-        }
-
-        if (key == "out_time"
-            && TimeSpan.TryParse(value, CultureInfo.InvariantCulture, out var time))
-        {
-            seconds = time.TotalSeconds;
-            return true;
-        }
-
-        return false;
+        return string.Join(
+            "\n",
+            result.Output
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(line => line.Trim()));
     }
 
     private void SetOutputPath(string path)
     {
         _outputPath = path;
+        if (OutputPathTextBlock is null)
+        {
+            return;
+        }
+
         OutputPathTextBlock.Text = path;
         OutputPathTextBlock.ToolTip = path;
     }
 
-    private static string BuildDefaultOutputPath(string inputPath)
+    private void RefreshDefaultOutputPathForCurrentMode()
     {
-        var directory = Path.GetDirectoryName(inputPath) ?? "";
-        var name = Path.GetFileNameWithoutExtension(inputPath);
-        var extension = Path.GetExtension(inputPath);
-        if (string.IsNullOrWhiteSpace(extension))
+        var defaultPath = CurrentCutMode switch
         {
-            extension = ".mp4";
-        }
-
-        return GetAvailableOutputPath(Path.Combine(directory, $"{name}_cut{extension}"));
-    }
-
-    private static string BuildPartOutputPath(string outputPath, int partNumber)
-    {
-        var directory = Path.GetDirectoryName(outputPath) ?? "";
-        var name = Path.GetFileNameWithoutExtension(outputPath);
-        var extension = Path.GetExtension(outputPath);
-
-        return Path.Combine(directory, $"{name}_part{partNumber}{extension}");
-    }
-
-    private static string GetAvailableOutputPath(string path)
-    {
-        if (!File.Exists(path))
-        {
-            return path;
-        }
-
-        var directory = Path.GetDirectoryName(path) ?? "";
-        var extension = Path.GetExtension(path);
-        var name = Path.GetFileNameWithoutExtension(path);
-        var (baseName, startIndex) = SplitNumberSuffix(name);
-
-        for (var index = Math.Max(1, startIndex + 1); ; index++)
-        {
-            var candidate = Path.Combine(directory, $"{baseName} ({index}){extension}");
-            if (!File.Exists(candidate))
-            {
-                return candidate;
-            }
-        }
-    }
-
-    private static (string BaseName, int Index) SplitNumberSuffix(string name)
-    {
-        if (!name.EndsWith(')'))
-        {
-            return (name, 0);
-        }
-
-        var openIndex = name.LastIndexOf(" (", StringComparison.Ordinal);
-        if (openIndex < 0)
-        {
-            return (name, 0);
-        }
-
-        var numberText = name[(openIndex + 2)..^1];
-        return int.TryParse(numberText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var index)
-            ? (name[..openIndex], index)
-            : (name, 0);
-    }
-
-    private static string ResolveToolPath(string exeName)
-    {
-        var localPath = Path.Combine(AppContext.BaseDirectory, "tools", exeName);
-        return File.Exists(localPath) ? localPath : exeName;
-    }
-
-    private static async Task<ProcessResult> RunProcessAsync(string fileName, IEnumerable<string> arguments)
-    {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = fileName,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true
+            CutMode.Concat when _concatClips.Count > 0 => OutputPathService.BuildDefaultConcatOutputPath(_concatClips[0].Path),
+            CutMode.AudioExtract when !string.IsNullOrWhiteSpace(_inputPath) => OutputPathService.BuildDefaultAudioExtractOutputPath(_inputPath, GetSelectedAudioTrackOption()),
+            CutMode.Split when !string.IsNullOrWhiteSpace(_inputPath) => OutputPathService.BuildDefaultSplitOutputPath(_inputPath),
+            CutMode.Range when !string.IsNullOrWhiteSpace(_inputPath) => OutputPathService.BuildDefaultCutOutputPath(_inputPath, "_cut"),
+            _ => string.Empty
         };
 
-        foreach (var argument in arguments)
+        SetOutputPath(defaultPath);
+    }
+
+    private void ClearSingleVideoSelection()
+    {
+        _inputPath = null;
+        _singleInputDuration = TimeSpan.Zero;
+        if (CurrentCutMode != CutMode.Concat)
         {
-            startInfo.ArgumentList.Add(argument);
+            _duration = TimeSpan.Zero;
+            _currentConcatClipIndex = -1;
+            _mediaPlayer.Stop();
+            VideoView.Visibility = Visibility.Collapsed;
+            EmptyVideoText.Visibility = Visibility.Visible;
+            CurrentTimeText.Text = FormatTime(TimeSpan.Zero);
+            DurationText.Text = FormatTime(TimeSpan.Zero);
+            TimelineSlider.Maximum = 1;
+            TimelineSlider.Value = 0;
+            ResetDisplayClock(TimeSpan.Zero);
         }
 
-        using var process = Process.Start(startInfo)
-            ?? throw new InvalidOperationException($"{fileName} 실행에 실패했습니다.");
+        SetInputPathDisplay(null);
+        SetOutputPath(string.Empty);
+        ResetCutProgress();
+        SetStartTime(TimeSpan.Zero, adjustEnd: false);
+        SetEndTime(TimeSpan.Zero, adjustStart: false);
+        SetSplitTime(TimeSpan.Zero);
+        ClearAudioTrackOptions();
+        _isPlaybackPaused = true;
+        _isPlaybackEnded = false;
+        PlayPauseButton.Content = "재생";
+        SetControlsEnabled(HasPlayableInput);
+    }
 
-        var outputTask = process.StandardOutput.ReadToEndAsync();
-        var errorTask = process.StandardError.ReadToEndAsync();
+    private void SetInputPathDisplay(string? path)
+    {
+        FileNameText.Inlines.Clear();
+        FileNameText.FontWeight = FontWeights.Normal;
 
-        await process.WaitForExitAsync();
-        var output = await outputTask;
-        var error = await errorTask;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            FileNameText.Inlines.Add(new Run("선택한 비디오 없음"));
+            FileNameText.ToolTip = null;
+            return;
+        }
 
-        return new ProcessResult(process.ExitCode, output.Trim(), error.Trim());
+        var directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            FileNameText.Inlines.Add(new Run($"{directory}{Path.DirectorySeparatorChar}"));
+        }
+
+        FileNameText.Inlines.Add(new Run(Path.GetFileName(path))
+        {
+            FontWeight = FontWeights.SemiBold
+        });
+        FileNameText.ToolTip = path;
     }
 
     private static bool TryParseTimeInput(string text, out TimeSpan time)
@@ -1895,70 +1803,11 @@ public partial class MainWindow : Window
         return $"{totalHours:00}:{time.Minutes:00}:{time.Seconds:00}";
     }
 
-    private static string ToFfmpegTime(TimeSpan time)
-    {
-        return time.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture);
-    }
-
     private static string Shorten(string text)
     {
         text = text.ReplaceLineEndings(" ").Trim();
         return text.Length <= 180 ? text : text[..180] + "...";
     }
 
-    private sealed class AdditionalAudioPlayer
-    {
-        public AdditionalAudioPlayer(int trackId, int displayIndex, string name, LibVLC libVlc, VlcMediaPlayer player, VlcMedia media)
-        {
-            TrackId = trackId;
-            SelectedTrackId = trackId;
-            DisplayIndex = displayIndex;
-            Name = name;
-            LibVlc = libVlc;
-            Player = player;
-            Media = media;
-        }
-
-        public int TrackId { get; }
-
-        public int SelectedTrackId { get; set; }
-
-        public bool TrackSelectionSucceeded { get; set; }
-
-        public int DisplayIndex { get; }
-
-        public string Name { get; }
-
-        public LibVLC LibVlc { get; }
-
-        public VlcMediaPlayer Player { get; }
-
-        public VlcMedia Media { get; }
-
-        public bool IsEnabled { get; set; } = true;
-    }
-
-    private sealed class AudioTrackOption
-    {
-        public AudioTrackOption(int trackId, int displayIndex, string name)
-        {
-            TrackId = trackId;
-            DisplayIndex = displayIndex;
-            Name = name;
-        }
-
-        public int TrackId { get; }
-
-        public int DisplayIndex { get; }
-
-        public string Name { get; }
-
-        public bool ExcludeFromOutput { get; set; }
-
-        public bool MuteInOutput { get; set; }
-    }
-
-    private sealed record ProcessResult(int ExitCode, string Output, string Error);
-
-    private sealed record CutJob(TimeSpan Start, TimeSpan Duration, string OutputPath);
 }
+

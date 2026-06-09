@@ -11,7 +11,6 @@ A Windows video cutting app for previewing a video and quickly cutting the secti
 - Cut a video by selecting a start and end range.
 - Split a video into two sections at one point.
 - Set the start, end, or split point from the current playback position.
-- Move backward/forward with the arrow keys and toggle play/pause with Space.
 - Choose which audio track to play when multiple tracks are available.
 - Remove selected audio tracks from the exported file.
 - Mute selected audio tracks in the exported file.
